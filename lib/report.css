@@ -1,0 +1,166 @@
+/* puffr burn report: Abunai Co arcade look, compact data first.
+   Palette sources (abunaico.com repo, read-only):
+   navy #0B2350, sky #7DBEF5, sky-hi #A9D5FA, wave #1E6FD9, wave-deep #0F4FB0, foam #FFFFFF,
+   orange #F2602B, orange-deep #C9431A, steel #5E7088, c64 #3B2EA0, c64-ink #B3A8FF   app/brief.css :root
+   amber #F2C230                                                                     app/bbs.css (.case-tag, .boss b)
+   led green #3BD44F, red #E0402A                                                    app/amiga.css, app/bbs.css (.c64-rb)
+   PUFFR hazard amber #E0A526            vault Marketing/Brand/2026-09-30_5.02.01.PM_pixel-visual-direction.md
+   No web fonts: the site's Silkscreen/VT323 are replaced by system monospace so the file stays self-contained. */
+:root{
+  color-scheme:light;
+  --bg:#A9D5FA; --panel:#FFFFFF; --ink:#0B2350; --dim:#5E7088; --line:#0B2350; --rule:#C9DDF2;
+  --head:#0B2350; --head-ink:#F2C230; --hover:#E8F3FD; --accent:#E0A526; --bar:#E0A526;
+  --good:#1F8A3A; --bad:#C9431A; --warn:#C9431A; --shadow:#0B2350; --tab:#7DBEF5;
+  --pixel:ui-monospace,"SF Mono",Menlo,Consolas,"Courier New",monospace;
+  --body:ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+}
+:root[data-theme=dark]{
+  color-scheme:dark;
+  --bg:#0B2350; --panel:#10162E; --ink:#E4DEFF; --dim:#B3A8FF; --line:#3B2EA0; --rule:#1E2550;
+  --head:#3B2EA0; --head-ink:#F2C230; --hover:#18204A; --accent:#F2C230; --bar:#F2C230;
+  --good:#3BD44F; --bad:#E0402A; --warn:#F2602B; --shadow:#000000; --tab:#1E2550;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  color-scheme:dark;
+  --bg:#0B2350; --panel:#10162E; --ink:#E4DEFF; --dim:#B3A8FF; --line:#3B2EA0; --rule:#1E2550;
+  --head:#3B2EA0; --head-ink:#F2C230; --hover:#18204A; --accent:#F2C230; --bar:#F2C230;
+  --good:#3BD44F; --bad:#E0402A; --warn:#F2602B; --shadow:#000000; --tab:#1E2550;
+}}
+*{box-sizing:border-box}
+body{margin:0 auto; max-width:1040px; padding:20px 16px 32px; background:var(--bg); color:var(--ink);
+  font:14px/1.45 var(--body);
+  /* sparse scanlines, the CRT nod */
+  background-image:repeating-linear-gradient(0deg,transparent 0 3px,rgba(11,35,80,.05) 3px 4px)}
+h1,h2{font-family:var(--pixel); font-weight:800; text-transform:uppercase; letter-spacing:.06em; line-height:1.15}
+h1{font-size:20px; margin:0 0 6px; padding:8px 12px; background:var(--head); color:#FFFFFF;
+  border:3px solid var(--line); box-shadow:5px 5px 0 var(--shadow); display:inline-block}
+h1 em{font-style:normal; color:var(--head-ink)}
+h2{font-size:13px; margin:22px 0 6px; display:flex; align-items:center; gap:8px}
+h2::before{content:"🐡"; font-size:14px; line-height:1; flex:none}
+.sub,.note,small{color:var(--dim)}
+.note{font-size:12px; margin:4px 0}
+.stats{display:flex; flex-wrap:wrap; gap:10px; margin:14px 0}
+.stats div{background:var(--panel); border:3px solid var(--line); box-shadow:4px 4px 0 var(--shadow); padding:6px 10px; min-width:118px}
+.stats b{display:block; font:800 17px/1.2 var(--pixel); font-variant-numeric:tabular-nums}
+.stats span{font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em}
+.ucef-box{background:var(--panel); border:3px solid var(--line); box-shadow:5px 5px 0 var(--shadow); padding:14px 16px; margin:14px 0}
+.ucef-box .hero{display:flex; align-items:baseline; gap:10px; flex-wrap:wrap}
+.ucef-box .hero b{font:800 28px/1 var(--pixel); color:var(--accent); font-variant-numeric:tabular-nums}
+.ucef-box .hero span{font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.04em}
+.ucef-box .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-top:12px}
+.ucef-box .grid div{background:var(--bg); border:2px solid var(--rule); padding:6px 9px}
+.ucef-box .grid b{display:block; font:800 15px var(--pixel); font-variant-numeric:tabular-nums}
+.ucef-box .grid span{font-size:10.5px; color:var(--dim); text-transform:uppercase; letter-spacing:.03em}
+.value-box .vsum{margin:10px 0 0; font-size:13px; line-height:1.45}
+.wrap{overflow-x:auto; background:var(--panel); border:3px solid var(--line); box-shadow:5px 5px 0 var(--shadow)}
+table{width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums}
+th,td{padding:4px 8px; border-bottom:1px solid var(--rule); text-align:left}
+th,td.n{white-space:nowrap} td{overflow-wrap:break-word}
+th{position:sticky; top:0; background:var(--head); color:var(--head-ink); font:700 11px/1.3 var(--pixel);
+  text-transform:uppercase; letter-spacing:.05em; cursor:pointer; user-select:none}
+th:hover,th:focus{color:#FFFFFF; outline:none; box-shadow:inset 0 -3px 0 var(--accent)}
+th[data-d=asc]::after{content:" ▲"} th[data-d=desc]::after{content:" ▼"}
+.n{text-align:right}
+td.n{font-family:var(--pixel); font-size:12.5px}
+tr.kid td:first-child{padding-left:26px; color:var(--dim)}
+tr.kid td:first-child::before{content:"└ "; color:var(--accent)}
+tr:hover td{background:var(--hover)}
+.bar{display:inline-block; height:8px; background:var(--bar); margin-right:6px; vertical-align:middle;
+  box-shadow:1px 1px 0 var(--shadow)}
+.good{color:var(--good); font-weight:700} .bad{color:var(--bad); font-weight:700}
+.prac,.insights{list-style:none; padding:0; margin:0; background:var(--panel); border:3px solid var(--line); box-shadow:5px 5px 0 var(--shadow)}
+.prac li,.insights li{padding:7px 12px; border-bottom:1px solid var(--rule); display:grid; gap:1px}
+.prac li:last-child,.insights li:last-child{border-bottom:0}
+.prac small,.insights small{font-size:12px}
+.prac li.warn b::before{content:"▲ "; color:var(--warn)} .prac li.ok b::before{content:"✓ "; color:var(--good)}
+.rules{margin-bottom:22px} .rules b::before{content:"› "; color:var(--accent)}
+.insights{counter-reset:ins}
+.insights li{counter-increment:ins; grid-template-columns:auto 1fr auto; column-gap:10px; align-items:baseline}
+.insights li::before{content:counter(ins); font:800 13px var(--pixel); color:var(--panel); background:var(--accent);
+  padding:0 6px; box-shadow:2px 2px 0 var(--shadow); grid-row:span 2}
+.insights b{grid-column:2} .insights span{grid-column:3; font:800 13px var(--pixel); color:var(--good); white-space:nowrap}
+.insights small{grid-column:2 / span 2}
+.tabs{display:flex; flex-wrap:wrap; gap:6px; margin:14px 0 4px}
+.tabs button{font:700 12px var(--pixel); text-transform:uppercase; letter-spacing:.05em; color:var(--ink); background:var(--tab);
+  border:3px solid var(--line); box-shadow:3px 3px 0 var(--shadow); padding:5px 12px; cursor:pointer}
+.tabs button:hover,.tabs button:focus-visible{outline:none; background:var(--hover)}
+.tabs button[aria-selected=true]{background:var(--accent); color:#0B2350; transform:translate(2px,2px); box-shadow:1px 1px 0 var(--shadow)}
+.panel[hidden]{display:none}
+footer.cost{margin-top:26px; padding:10px 12px; background:var(--panel); border:3px dashed var(--line); font-size:12px; color:var(--dim)}
+footer.cost table{font-size:12px} footer.cost td,footer.cost th{padding:3px 8px}
+footer.cost dl{display:grid; grid-template-columns:auto 1fr; gap:2px 12px; margin:6px 0 0} footer.cost dt{font-family:var(--pixel); color:var(--ink)}
+footer.cost dd{margin:0}
+@media (max-width:560px){h1{font-size:16px} .stats div{min-width:0; flex:1 1 40%}}
+/* hover cards and drill-down drawer */
+tr[data-ft]{cursor:pointer} tr[data-ft]:focus td{background:var(--hover); outline:none}
+[data-tip]{cursor:help}
+.tipcard{position:fixed; z-index:20; max-width:360px; background:var(--panel); color:var(--ink); border:3px solid var(--line);
+  box-shadow:5px 5px 0 var(--shadow); padding:8px 10px; font-size:12.5px; pointer-events:none}
+.tipcard b{display:block; font:800 12px/1.3 var(--pixel); text-transform:uppercase; letter-spacing:.04em; margin-bottom:3px}
+.tipcard p{margin:2px 0} .tipcard .dim,.tipcard small{color:var(--dim)} .tipcard small{display:block; margin-top:4px; font:700 10.5px var(--pixel); text-transform:uppercase}
+.tipcard dl{display:grid; grid-template-columns:auto 1fr; gap:1px 8px; margin:5px 0 0} .tipcard dt{font:700 11px var(--pixel); color:var(--accent)} .tipcard dd{margin:0}
+.tipcard code{display:block; margin-top:4px; font:12px var(--pixel); color:var(--accent)}
+.veil{position:fixed; inset:0; z-index:30; background:rgba(11,35,80,.45)}
+.drawer{position:fixed; z-index:31; top:0; right:0; bottom:0; width:min(760px,100%); overflow:auto; background:var(--bg);
+  border-left:3px solid var(--line); box-shadow:-6px 0 0 var(--shadow); padding:16px}
+.drawer h2{margin-top:4px} .drawer .x{float:right; font:800 14px var(--pixel); background:var(--accent); color:#0B2350; border:3px solid var(--line);
+  box-shadow:3px 3px 0 var(--shadow); cursor:pointer; padding:2px 9px}
+.tagline{margin:6px 0 0; font:italic 700 14px var(--pixel); letter-spacing:.03em; color:var(--ink)}
+h1 .fishes{position:relative; display:inline-block; width:78px; height:56px; margin:-18px 6px -18px -10px; vertical-align:middle}
+h1 .fishes img{position:absolute; inset:0; width:100%; height:100%; transition:opacity .12s steps(2)}
+h1 .puff,h1:hover .flat{opacity:0} h1:hover .puff{opacity:1}
+.tfilter{display:flex; align-items:center; gap:10px; margin:0 0 8px}
+.tfilter input{font:13px var(--pixel); color:var(--ink); background:var(--panel); border:3px solid var(--line); box-shadow:3px 3px 0 var(--shadow);
+  padding:4px 8px; width:min(320px,100%)}
+.tfilter input:focus{outline:none; box-shadow:3px 3px 0 var(--accent)}
+.tfilter span{font:700 11px var(--pixel); color:var(--dim); text-transform:uppercase}
+tr[hidden]{display:none}
+/* back to top: a small ANSI PUFFR swims along the bottom as you scroll (the script moves him),
+   puffs up when clicked, and swims you back up. The art faces left; .right mirrors it. */
+.totop{position:fixed; left:0; bottom:16px; z-index:15; width:68px; height:64px; padding:0; border:0; background:none; cursor:pointer;
+  filter:drop-shadow(2px 2px 0 var(--shadow)); opacity:0; visibility:hidden; transition:opacity .25s, visibility .25s, translate .15s}
+.totop.show{opacity:1; visibility:visible}
+.totop:hover{translate:0 -3px}
+/* He's a body plus four layers cut from one strip of held cels: face, side fin, top fin, tail.
+   The script picks each layer's cel by index (--face, --pec, --fin, --tail). */
+.totop i{display:block; width:100%; height:100%; image-rendering:pixelated; background-repeat:no-repeat;
+  background-image:var(--cels), var(--cels), var(--cels), var(--cels), var(--puffr-body);
+  background-size:var(--strip) auto, var(--strip) auto, var(--strip) auto, var(--strip) auto, 68px auto;
+  background-position:calc(var(--face, 0) * -68px) 100%, calc(var(--pec, 0) * -68px) 100%,
+    calc(var(--fin, 6) * -68px) 100%, calc(var(--tail, 3) * -68px) 100%, 50% 100%}
+.totop.right i{transform:scaleX(-1)}
+/* the body rocks against the tail beat (--rot, set per kick); at rest he bobs, stepped like cels */
+.totop i{rotate:var(--rot, 0deg); transition:rotate .08s steps(2)}
+.totop span{display:block; height:100%; animation:bob 2.6s steps(2) infinite}
+@keyframes bob{50%{translate:0 -2px}}
+.totop.moving span{animation:none}
+/* puffed: his own 3-cel strip (rest, paddle up, paddle down); the script cycles --pf while he floats */
+.totop.puffed i{background:var(--puff-cels) no-repeat calc(var(--pf, 0) * -68px) 100%/204px auto}
+/* the startle gag animates the span (squash and stretch, roll, lift) with the Web Animations API,
+   so it never touches his facing (<i>) or his position (.totop) */
+.totop.gag span{animation:none} .totop.gag i{transition:none}
+/* bubbles: their own elements, released where he is. Most wobble up a little way and pop into a
+   sparkle; a few (the big ones) keep going, speeding up, growing and drifting with the current until
+   they leave through the top. The script sets each one's fate. */
+.bubble{position:fixed; z-index:14; width:var(--s); height:var(--s); border:2px solid rgba(11,35,80,.5); border-radius:50%;
+  background:rgba(255,255,255,.4); box-shadow:inset -2px -2px 0 rgba(125,190,245,.6), inset 2px 2px 0 #fff; pointer-events:none;
+  animation:rise var(--t) cubic-bezier(.4,0,.75,.75) var(--d) both, sway var(--sw) ease-in-out var(--d) infinite alternate,
+    wobble var(--wb) ease-in-out var(--d) infinite alternate, grow var(--t) ease-in var(--d) both}
+.bubble.pop{animation:pop .22s ease-out both}
+@keyframes rise{0%{opacity:0; translate:0 0} 8%{opacity:1} 90%{opacity:1} 100%{opacity:var(--end, 0); translate:var(--dx) calc(-1 * var(--rise))}}
+@keyframes sway{from{transform:translateX(calc(-1 * var(--w)))} to{transform:translateX(var(--w))}}
+@keyframes wobble{from{scale:1.12 .9} to{scale:.9 1.12}}
+@keyframes grow{to{width:calc(var(--s) * var(--g)); height:calc(var(--s) * var(--g))}}
+@keyframes pop{to{opacity:0; scale:.2; box-shadow:0 -10px 0 -2px rgba(11,35,80,.6), 0 10px 0 -2px rgba(11,35,80,.6), -10px 0 0 -2px rgba(11,35,80,.6), 10px 0 0 -2px rgba(11,35,80,.6)}}
+@media (prefers-reduced-motion:reduce){.totop span,.totop i,.bubble{animation:none; transition:none} .bubble{display:none}}
+.totop:focus-visible{outline:3px solid var(--accent); outline-offset:3px}
+@media print{.totop{display:none}}
+
+/* swarm: concurrency chart. Colors come from the theme variables, so light and dark both work. */
+.chart{display:block; width:100%; height:auto; background:var(--panel); border:3px solid var(--line); box-shadow:5px 5px 0 var(--shadow)}
+.chart .lane{fill:var(--head)} .chart .sub{fill:var(--bar)}
+.chart .grid{stroke:var(--rule); stroke-width:1} .chart .peak{stroke:var(--bad); stroke-width:1.5; stroke-dasharray:3 3}
+.chart .band{fill:var(--hover); opacity:.7} .chart .band.alt{opacity:.35}
+.chart text{fill:var(--ink); font:700 10px var(--pixel)} .chart text.ax{fill:var(--dim); font-weight:400}
+.chartkey .k{display:inline-block; width:10px; height:10px; margin:0 3px 0 10px; vertical-align:baseline; box-shadow:1px 1px 0 var(--shadow)}
+.chartkey .k:first-child{margin-left:0} .chartkey .k.lane{background:var(--head)} .chartkey .k.sub{background:var(--bar)}

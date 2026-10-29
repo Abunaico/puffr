@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// puffr help: the pufferfish, the commands, and how to customize reports.
+// The fish is truecolor ANSI half-blocks drawn from the abunaico.com PUFFR
+// (assets/puffr-flat.ans, puffr-puff.ans), shown only where colors work.
+// Usage: puffr-help [--puff] [--plain]
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const F = require('../lib/puffr.js');
+
+const PLAIN = process.argv.includes('--plain');
+// Claude Code runs commands (including ! ones) with stdout captured, not a TTY, while
+// advertising truecolor through COLORTERM; trust that there. FORCE_COLOR is the usual override.
+const TRUECOLOR = /^(truecolor|24bit)$/i.test(process.env.COLORTERM || '');
+const COLOR = !PLAIN && !process.env.NO_COLOR && (process.stdout.isTTY || process.argv.includes('--color')
+  || !!process.env.FORCE_COLOR || (process.env.CLAUDECODE === '1' && TRUECOLOR));
+const C = (c, s) => COLOR ? `\x1b[${c}m${s}\x1b[0m` : s;
+const version = (F.readJson(path.join(F.PUFFR_ROOT, '.claude-plugin', 'plugin.json'), {}) || {}).version || '?';
+
+const COMMANDS = [
+  ['/puffr:hud', 'Check the HUD statusline; install, repair, remove'],
+  ['/puffr:layout', 'List, switch, or make HUD layouts (/puffr:compact, /puffr:detailed are shortcuts)'],
+  ['/puffr:settings', 'Turn features on or off: HUD segments, fleet rows, banner, watch, autoname'],
+  ['/puffr:context', "What's filling this session's context, and how the prompt cache is holding"],
+  ['/puffr:accounts', 'Every Claude Code login here with its 5h/7d usage and reset times'],
+  ['/puffr:sessions', 'Find, name, star, archive, and save Claude and Codex sessions; restore them'],
+  ['/puffr:burn', 'Spend by account, project, agent, work type, and tool; insights; --html to share'],
+  ['/puffr:swarm', 'How parallel a many-session run was: lanes, subagents, phases, messages; machines; reconcile to a bill'],
+  ['/puffr:update', 'Update puffr everywhere it is installed; "check" just compares'],
+  ['/puffr:open', 'Resume or fork a session in a new tmux or Warp pane'],
+  ['/puffr:fleet', 'Explain or tune the subagent fleet rows'],
+  ['/puffr:off, /puffr:on', 'Mute or unmute everything at once'],
+  ['/puffr:help', 'This list'],
+];
+const CUSTOMIZE = [
+  ['puffr-burn --add-rule "abunai is the same as abunaico"', 'add a plain-English rule'],
+  ['puffr-burn --rules', 'see the rules and what they changed'],
+  ['puffr-burn --recompile', 'apply them again'],
+];
+
+const out = [];
+// --plain gets a one-color fish drawn for text-only views like the chat.
+if (PLAIN) { try { out.push(fs.readFileSync(path.join(F.PUFFR_ROOT, 'assets', 'puffr-mono.txt'), 'utf8').replace(/\n$/, '')); } catch {} }
+if (COLOR) {
+  const art = process.argv.includes('--puff') ? 'puffr-puff.ans' : 'puffr-flat.ans';
+  try { out.push(fs.readFileSync(path.join(F.PUFFR_ROOT, 'assets', art), 'utf8').replace(/\n$/, '')); } catch {}
+}
+out.push(`${C('1;33', 'PUFFR')} ${C('2', `v${version}`)}  ${C('3', 'Fu the Bloat. Cool the Burn.')}`);
+out.push(C('2', 'context, cost & fleet HUD for Claude Code and Codex · github.com/Abunaico/puffr · free + attribution'));
+out.push('');
+const w = Math.max(...COMMANDS.map(c => c[0].length));
+for (const [cmd, what] of COMMANDS) out.push(`  ${C('36', cmd.padEnd(w))}  ${what}`);
+out.push('');
+out.push(C('1', 'Customize reports'));
+out.push(`  Plain-English rules live in ${F.FILES.reportPrompt.replace(F.HOME, '~')} (ships empty).`);
+out.push('  Haiku turns them into renames, merges, account labels, and hidden projects before a report runs;');
+out.push('  only edits to names that exist are kept, and the result is cached until the rules change.');
+const cw = Math.max(...CUSTOMIZE.map(c => c[0].length));
+for (const [cmd, what] of CUSTOMIZE) out.push(`  ${C('36', cmd.padEnd(cw))}  ${C('2', what)}`);
+out.push('');
+out.push(C('2', 'Everything reads files Claude Code and Codex already write. Model calls happen only in autoname'));
+out.push(C('2', '(puffr-config off autoname), Haiku labels and report rules (opt-in), and puffr-update fetches the release.'));
+console.log(out.join('\n'));

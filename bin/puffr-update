@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// puffr update: bring every puffr install up to the latest release.
+// 1. Marketplace. A directory source that is a git clone on a clean main is
+//    fast-forwarded from origin; any other branch or uncommitted work is left
+//    alone and reported. Other sources are refreshed by Claude Code itself.
+// 2. `claude plugin marketplace update puffr-tools`, then `claude plugin update`
+//    once per install (project installs run from their project folder).
+// Usage: puffr-update [--check]
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const F = require('../lib/puffr.js');
+
+const CHECK = process.argv.includes('--check');
+const MP = 'puffr-tools', PLUGIN = 'puffr@puffr-tools';
+const PDIR = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(F.HOME, '.claude'), 'plugins');
+const CLAUDE = process.env.PUFFR_CLAUDE
+  || (process.env.CLAUDE_CODE_EXECPATH && fs.existsSync(process.env.CLAUDE_CODE_EXECPATH) ? process.env.CLAUDE_CODE_EXECPATH : 'claude');
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (c, s) => tty ? `\x1b[${c}m${s}\x1b[0m` : s;
+const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', timeout: 180000, ...opts });
+const git = (dir, ...a) => run('git', ['-C', dir, ...a]);
+const out = r => F.clean(`${r.stdout || ''}${r.stderr || ''}`.trim().split('\n').pop() || (r.error && r.error.message) || '');
+const installs = () => ((F.readJson(path.join(PDIR, 'installed_plugins.json'), {}) || {}).plugins || {})[PLUGIN] || [];
+const versionAt = dir => (F.readJson(path.join(dir, '.claude-plugin', 'plugin.json'), {}) || {}).version || '?';
+
+const mp = (F.readJson(path.join(PDIR, 'known_marketplaces.json'), {}) || {})[MP];
+if (!mp) { console.error('puffr-update: the puffr-tools marketplace is not configured. Add it with: /plugin marketplace add Abunaico/puffr'); process.exit(1); }
+const before = installs();
+console.log(`🐡 puffr update${CHECK ? C('2', ' (check only, nothing changes)') : ''}\n`);
+
+const src = mp.source || {};
+if (src.source === 'directory' && typeof src.path === 'string') {
+  const dir = src.path;
+  if (!fs.existsSync(path.join(dir, '.git'))) console.log(`  marketplace  ${F.clean(dir)} ${C('2', '(plain folder, read as is)')}`);
+  else {
+    const fetched = git(dir, 'fetch', '-q', 'origin');
+    const branch = git(dir, 'rev-parse', '--abbrev-ref', 'HEAD').stdout.trim();
+    const dirty = git(dir, 'status', '--porcelain', '--untracked-files=no').stdout.trim() !== '';
+    const behind = parseInt(git(dir, 'rev-list', '--count', 'HEAD..origin/main').stdout, 10) || 0;
+    let latest = '?';
+    try { latest = JSON.parse(git(dir, 'show', 'origin/main:.claude-plugin/plugin.json').stdout).version || '?'; } catch {}
+    console.log(`  marketplace  ${F.clean(dir)} · ${F.clean(branch)}${dirty ? C('33', ' (uncommitted changes)') : ''} · here ${versionAt(dir)} · latest ${latest}${fetched.status ? C('33', ' (fetch failed, using what is here)') : ''}`);
+    if (behind && !CHECK) {
+      if (branch !== 'main' || dirty) console.log(C('33', `  not pulling ${behind} new commit${behind === 1 ? '' : 's'}: the clone is not on a clean main, and puffr never touches work in progress`));
+      else {
+        const r = git(dir, 'merge', '--ff-only', '-q', 'origin/main');
+        console.log(r.status === 0 ? `  pulled ${behind} commit${behind === 1 ? '' : 's'} → ${versionAt(dir)}` : C('31', `  pull failed: ${out(r)}`));
+      }
+    } else if (!behind) console.log(C('2', '  marketplace is up to date'));
+  }
+} else console.log(`  marketplace  ${F.clean(src.repo || src.url || src.source || '?')} ${C('2', '(Claude Code refreshes it)')}`);
+
+if (CHECK) {
+  for (const i of before) console.log(`  ${String(i.scope).padEnd(8)} installed ${F.clean(i.version)}${i.projectPath ? C('2', ` · ${F.clean(i.projectPath)}`) : ''}`);
+  console.log(C('2', '\n  Run puffr-update (without --check) to apply.'));
+  process.exit(0);
+}
+
+const m = run(CLAUDE, ['plugin', 'marketplace', 'update', MP]);
+console.log(m.status === 0 ? C('2', '  marketplace catalog refreshed') : C('31', `  marketplace refresh failed: ${out(m)}`));
+let failed = 0;
+for (const i of before) {
+  const cwd = i.projectPath && fs.existsSync(i.projectPath) ? i.projectPath : F.HOME;
+  const r = run(CLAUDE, ['plugin', 'update', PLUGIN, '--scope', i.scope], { cwd });
+  if (r.status !== 0) failed++;
+  const now = installs().find(x => x.scope === i.scope && (x.projectPath || '') === (i.projectPath || ''));
+  const to = now ? now.version : '?';
+  console.log(`  ${String(i.scope).padEnd(8)} ${F.clean(i.version)} → ${to === i.version ? C('2', `${F.clean(to)} (no change)`) : C('32', F.clean(to))}${i.projectPath ? C('2', ` · ${F.clean(i.projectPath)}`) : ''}${r.status ? C('31', `  failed: ${out(r)}`) : ''}`);
+}
+if (!before.length) console.log(C('33', '  puffr is not installed from the marketplace. Install it with: /plugin install puffr@puffr-tools'));
+console.log(C('2', '\n  New sessions load the update; restart or /resume running ones.'));
+process.exit(failed ? 1 : 0);

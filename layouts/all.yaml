@@ -1,0 +1,15 @@
+# all: every widget puffr has, one labeled line each, like Claude Code's /status.
+lines:
+  - [fish, model]
+  - version:      [version]
+  - session:      [session]
+  - folder:       [dir, ·, git]
+  - account:      [account, plan, ·, org]
+  - mode:         [effort, ·, style]
+  - context:      [context-bar, context-full, ·, context-tokens, ·, context-warning]
+  - 5-hour limit: [5h-used, ·, 5h-resets, 5h-clock, ·, 5h-pace-words]
+  - weekly limit: [7d-used, ·, 7d-resets, 7d-clock, ·, 7d-pace-words]
+  - prompt cache: [cache-words, cache-why, ·, nudge]
+  - cost:         [cost-words]
+  - time:         [duration, ·, api-time]
+  - code changes: [lines]

@@ -1,0 +1,222 @@
+#!/usr/bin/env node
+// puffr installer, built for npx:
+//   npx github:Abunaico/puffr            (straight from GitHub, nothing published)
+//   npx @abunaico/puffr                  (once published to npm)
+//
+// Follows the UCEF installer's shape: register the marketplace with
+// `claude plugin marketplace add`, install with `claude plugin install
+// <plugin>@<marketplace> --scope`, and offer update/uninstall. Then it can wire
+// the HUD and, on request, the VS Code panel and a Warp side pane.
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline');
+const { spawnSync } = require('child_process');
+
+const REPO = 'Abunaico/puffr';
+const MARKETPLACE = 'puffr-tools';
+const PLUGIN = `puffr@${MARKETPLACE}`;
+const ROOT = path.join(__dirname, '..');
+const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, '.claude-plugin', 'plugin.json'), 'utf8')).version;
+const HOME = os.homedir();
+const VSCODE_EXT_DIR = process.env.PUFFR_VSCODE_EXTENSIONS || path.join(HOME, '.vscode', 'extensions');
+const EXT_FOLDER = 'abunaico.puffr';
+const WARP_CONFIG = path.join(HOME, '.warp', 'launch_configurations', 'puffr.yaml');
+
+const args = process.argv.slice(2);
+const has = f => args.includes(f);
+const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
+const cmd = ['install', 'update', 'uninstall', 'status'].find(c => args.includes(c)) || 'install';
+const scope = val('--scope', process.env.PLUGIN_SCOPE || 'user');
+const DRY = has('--dry-run');
+const YES = has('--yes') || has('-y');
+const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+
+const C = (c, s) => (process.stdout.isTTY ? `\x1b[${c}m${s}\x1b[0m` : s);
+const info = m => console.log(`${C('36', '🐡')} ${m}`);
+const ok = m => console.log(`${C('32', '✔')} ${m}`);
+const warn = m => console.log(`${C('33', '!')} ${m}`);
+const fail = m => { console.error(`${C('31', '✘')} ${m}`); process.exit(1); };
+
+function help() {
+  console.log(`🐡 puffr installer ${VERSION}
+
+Usage: npx github:${REPO} [command] [options]
+
+Commands:
+  install      Add the ${MARKETPLACE} marketplace, install the plugin, wire the HUD (default)
+  update       Refresh the marketplace and update the plugin (and VS Code panel if installed)
+  uninstall    Remove the plugin, marketplace, HUD statusLine, VS Code panel, Warp pane
+  status       Show what's installed
+
+Options:
+  --scope user|project   Plugin scope (default: user, or $PLUGIN_SCOPE)
+  --vscode / --no-vscode Install the VS Code panel (status bar, sidebar, dashboard)
+  --warp / --no-warp     Add a Warp launch configuration with puffr-dash in a side pane
+  --no-hud               Skip pointing the Claude Code statusLine at puffr's HUD
+  -y, --yes              Accept the defaults without asking
+  --dry-run              Print what would run, change nothing
+  --help                 This help`);
+}
+
+function run(bin, argv, { quiet = false, allowFail = false } = {}) {
+  const shown = `${bin} ${argv.join(' ')}`;
+  if (DRY) { console.log(C('2', `  would run: ${shown}`)); return { status: 0, stdout: '' }; }
+  const r = spawnSync(bin, argv, { encoding: 'utf8', stdio: quiet ? 'pipe' : ['ignore', 'inherit', 'inherit'] });
+  if (r.error && r.error.code === 'ENOENT') fail(`${bin} not found on PATH`);
+  if (r.status !== 0 && !allowFail) fail(`${shown} failed (exit ${r.status})`);
+  return r;
+}
+
+const onPath = bin => spawnSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).status === 0;
+
+async function ask(question, def) {
+  if (YES || !isTTY) return def;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const a = await new Promise(r => rl.question(`${question} ${def ? '[Y/n]' : '[y/N]'} `, r));
+  rl.close();
+  return a.trim() ? /^y/i.test(a.trim()) : def;
+}
+
+function checkDeps() {
+  if (!onPath('claude')) fail('Claude Code (`claude`) is not on PATH. Install it first: https://code.claude.com');
+  if (!onPath('jq')) warn('`jq` not found: the HUD needs it (brew install jq).');
+  ok(`node ${process.versions.node}, claude ${(spawnSync('claude', ['--version'], { encoding: 'utf8' }).stdout || '').trim()}`);
+}
+
+function installedPlugins() {
+  const r = spawnSync('claude', ['plugin', 'list', '--json'], { encoding: 'utf8' });
+  try { const j = JSON.parse(r.stdout); return (Array.isArray(j) ? j : j.plugins || []).filter(p => p.id === PLUGIN); } catch { return []; }
+}
+
+function marketplaceAdded() {
+  const r = spawnSync('claude', ['plugin', 'marketplace', 'list'], { encoding: 'utf8' });
+  return new RegExp(`\\b${MARKETPLACE}\\b`).test(r.stdout || '');
+}
+
+function pluginDir() {
+  const p = installedPlugins().find(x => x.scope === scope) || installedPlugins()[0];
+  const dir = p && (p.readFromFolder || p.installPath);
+  return dir && fs.existsSync(path.join(dir, 'bin', 'puffr-hud')) ? dir : null;
+}
+
+// --- VS Code panel: a self-contained copy, so it never depends on the npx cache ---
+function extDirs() {
+  try { return fs.readdirSync(VSCODE_EXT_DIR).filter(d => d.startsWith(EXT_FOLDER) || d.startsWith('puffr-')).map(d => path.join(VSCODE_EXT_DIR, d)); } catch { return []; }
+}
+
+function copyDir(from, to, skip = () => false) {
+  fs.mkdirSync(to, { recursive: true });
+  for (const e of fs.readdirSync(from, { withFileTypes: true })) {
+    if (skip(e.name)) continue;
+    const s = path.join(from, e.name), d = path.join(to, e.name);
+    if (e.isDirectory()) copyDir(s, d, skip);
+    else { fs.copyFileSync(s, d); fs.chmodSync(d, fs.statSync(s).mode); }
+  }
+}
+
+function installVscode() {
+  const links = extDirs().filter(d => fs.lstatSync(d).isSymbolicLink());
+  if (links.length && !has('--force')) {
+    warn(`VS Code panel is a dev symlink (${links[0]}); leaving it. Pass --force to replace it.`);
+    return;
+  }
+  const target = path.join(VSCODE_EXT_DIR, `${EXT_FOLDER}-${VERSION}`);
+  if (DRY) { console.log(C('2', `  would copy vscode-ext + panel + lib + bin + fish art into ${target}`)); return; }
+  for (const d of extDirs()) fs.rmSync(d, { recursive: true, force: true });
+  copyDir(path.join(ROOT, 'vscode-ext'), target);
+  copyDir(path.join(ROOT, 'panel'), path.join(target, 'panel'));
+  copyDir(path.join(ROOT, 'lib'), path.join(target, 'lib'));
+  fs.mkdirSync(path.join(target, 'assets'), { recursive: true });
+  for (const a of ['puffr-flat.png', 'puffr-puff.png']) fs.copyFileSync(path.join(ROOT, 'assets', a), path.join(target, 'assets', a));
+  copyDir(path.join(ROOT, 'bin'), path.join(target, 'bin'), n => n === 'puffr-install');
+  fs.mkdirSync(path.join(target, '.claude-plugin'), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, '.claude-plugin', 'plugin.json'), path.join(target, '.claude-plugin', 'plugin.json'));
+  ok(`VS Code panel installed: ${target}`);
+  info('Reload VS Code (Developer: Reload Window). Look for 🐡 in the status bar and the fish in the Activity Bar.');
+}
+
+function installWarp() {
+  const yaml = `---
+name: Puffr side panel
+windows:
+  - tabs:
+      - title: "🐡 puffr"
+        layout:
+          split_direction: horizontal
+          panes:
+            - cwd: ${HOME}
+              is_focused: true
+            - cwd: ${HOME}
+              commands:
+                - exec: puffr-dash
+`;
+  if (DRY) { console.log(C('2', `  would write ${WARP_CONFIG}`)); return; }
+  fs.mkdirSync(path.dirname(WARP_CONFIG), { recursive: true });
+  fs.writeFileSync(WARP_CONFIG, yaml);
+  ok(`Warp launch configuration: ${WARP_CONFIG} (Warp > Launch Configurations > Puffr side panel)`);
+}
+
+function hud(action) {
+  const dir = pluginDir();
+  if (!dir) { warn(`Couldn't locate the installed plugin. In a new Claude Code session run: /puffr:hud ${action}`); return; }
+  run(path.join(dir, 'bin', 'puffr-hud'), [action], { allowFail: true });
+}
+
+async function install() {
+  info(`puffr ${VERSION} installer (scope: ${scope})`);
+  checkDeps();
+  if (marketplaceAdded()) ok(`marketplace ${MARKETPLACE} already added`);
+  else { info(`adding marketplace ${REPO}`); run('claude', ['plugin', 'marketplace', 'add', REPO]); }
+  info(`installing ${PLUGIN}`);
+  run('claude', ['plugin', 'install', PLUGIN, '--scope', scope]);
+  if (!has('--no-hud')) hud('install');
+
+  const hasVscode = fs.existsSync(path.join(HOME, '.vscode')) || fs.existsSync('/Applications/Visual Studio Code.app');
+  if (has('--vscode') || (!has('--no-vscode') && hasVscode && await ask('Install the VS Code panel (status bar, sidebar, dashboard)?', true))) installVscode();
+  const hasWarp = fs.existsSync(path.join(HOME, '.warp')) || fs.existsSync('/Applications/Warp.app');
+  if (has('--warp') || (!has('--no-warp') && hasWarp && await ask('Add a Warp launch configuration with puffr-dash in a side pane?', false))) installWarp();
+
+  console.log(`
+${C('1', '🐡 puffr is installed.')} Start a new Claude Code session, then:
+  /puffr:sessions     scan every session on this machine
+  /puffr:burn         where the tokens went
+  puffr-dash          live panel for a terminal split
+Docs: https://github.com/${REPO}`);
+}
+
+async function update() {
+  checkDeps();
+  run('claude', ['plugin', 'marketplace', 'update', MARKETPLACE]);
+  run('claude', ['plugin', 'update', PLUGIN]);
+  if (extDirs().some(d => !fs.lstatSync(d).isSymbolicLink())) installVscode();
+  ok('Updated. Restart Claude Code (and reload VS Code) to pick it up.');
+}
+
+async function uninstall() {
+  if (!await ask('Remove puffr: plugin, marketplace, HUD statusLine, VS Code panel, and Warp pane?', false)) { info('Nothing removed.'); return; }
+  hud('remove');
+  run('claude', ['plugin', 'uninstall', PLUGIN], { allowFail: true });
+  run('claude', ['plugin', 'marketplace', 'remove', MARKETPLACE], { allowFail: true });
+  for (const d of extDirs()) {
+    if (fs.lstatSync(d).isSymbolicLink() && !has('--force')) { warn(`kept dev symlink ${d}`); continue; }
+    if (DRY) console.log(C('2', `  would remove ${d}`)); else { fs.rmSync(d, { recursive: true, force: true }); ok(`removed ${d}`); }
+  }
+  if (fs.existsSync(WARP_CONFIG)) { if (DRY) console.log(C('2', `  would remove ${WARP_CONFIG}`)); else { fs.rmSync(WARP_CONFIG); ok(`removed ${WARP_CONFIG}`); } }
+  info('~/.puffr (settings, session index, saved transcripts) is left in place. Delete it yourself if you want it gone.');
+}
+
+async function status() {
+  const ps = installedPlugins();
+  if (!ps.length) warn('plugin: not installed');
+  for (const p of ps) ok(`plugin: ${p.id} ${p.version} (${p.scope}${p.enabled ? '' : ', disabled'})`);
+  (marketplaceAdded() ? ok : warn)(`marketplace ${MARKETPLACE}: ${marketplaceAdded() ? 'added' : 'missing'}`);
+  const ext = extDirs();
+  (ext.length ? ok : warn)(`VS Code panel: ${ext.length ? ext.map(d => d + (fs.lstatSync(d).isSymbolicLink() ? ' (dev symlink)' : '')).join(', ') : 'not installed'}`);
+  (fs.existsSync(WARP_CONFIG) ? ok : warn)(`Warp pane: ${fs.existsSync(WARP_CONFIG) ? WARP_CONFIG : 'not configured'}`);
+}
+
+if (has('--help') || has('-h')) { help(); process.exit(0); }
+if (!['user', 'project'].includes(scope)) fail(`--scope must be user or project, not ${scope}`);
+({ install, update, uninstall, status })[cmd]().catch(e => fail(e.message));

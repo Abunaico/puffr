@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+// puffr session radar: cross-project Claude Code session index and manager.
+// Indexing lives in lib/puffr.js (incremental, byte-range resume). Metadata
+// (name, star, archive, project) lives in ~/.puffr/sessions-meta.json; saved
+// transcripts in ~/.puffr/archive. Nothing here deletes a transcript.
+//
+// Usage: puffr-sessions [--limit N] [--json] [--project <substr>] [--active]
+//                      [--search <text>] [--starred] [--archived] [--tool claude|codex] [--reindex]
+//        puffr-sessions name <id> <text...>         ("" clears)
+//        puffr-sessions star|unstar|archive|unarchive <id>...
+//        puffr-sessions assign <id> <project>       ("-" clears)
+//        puffr-sessions merge [<name>... --into <project>]   (no args lists; --into "" unmerges)
+//        puffr-sessions save [<id>...] [--starred] [--expiring] [--all]
+//        puffr-sessions saved | restore <id>
+//        puffr-sessions label [--limit N] [--dry-run]   (Haiku, opt-in)
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const F = require('../lib/puffr.js');
+
+const args = process.argv.slice(2);
+const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 && i + 1 < args.length ? args[i + 1] : d; };
+const has = n => args.includes(n);
+const LIMIT = (() => { const n = parseInt(flag('--limit', '15'), 10); return Number.isFinite(n) && n > 0 ? n : 15; })();
+const AS_JSON = has('--json');
+const VALUED = new Set(['--limit', '--project', '--search', '--into', '--tool']);
+const pos = args.filter((a, i) => !a.startsWith('--') && !VALUED.has(args[i - 1]));
+const CMDS = new Set(['merge', 'name', 'star', 'unstar', 'archive', 'unarchive', 'assign', 'save', 'saved', 'restore', 'label']);
+const cmd = CMDS.has(pos[0]) ? pos[0] : null;
+const die = (m, code = 1) => { console.error(`puffr-sessions: ${m}`); process.exit(code); };
+
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (c, s) => tty ? `\x1b[${c}m${s}\x1b[0m` : s;
+const now = Date.now();
+const ago = ms => {
+  const m = Math.round((now - ms) / 60000);
+  return m < 60 ? `${m}m` : m < 1440 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d`;
+};
+
+let all;
+try { all = F.scan({ reindex: has('--reindex'), projFilter: cmd ? null : flag('--project', null) }); } catch (e) { die(e.message); }
+const meta = F.loadMeta();
+const pmap = F.loadProjects();
+const cwds = all.map(s => F.clean(s.state.cwd));
+const nameProject = F.projectNamer(cwds, pmap);
+
+// Commands return instead of exiting: process.exit can cut off piped stdout.
+(function main() {
+
+function resolve(ref) {
+  const r = String(ref || '').toLowerCase();
+  if (r.length < 6) die(`session id "${F.clean(ref)}" is too short (6+ characters)`, 2);
+  const hits = all.filter(s => s.id.toLowerCase().startsWith(r));
+  if (hits.length !== 1) die(hits.length ? `"${F.clean(ref)}" matches ${hits.length} sessions` : `no session ${F.clean(ref)}`, 2);
+  return hits[0];
+}
+const m = id => meta[id] || (meta[id] = {});
+const tidy = id => { for (const [k, v] of Object.entries(meta[id] || {})) if (v === '' || v === false || v == null) delete meta[id][k]; if (meta[id] && !Object.keys(meta[id]).length) delete meta[id]; };
+
+// --- merge: fold project names (renamed folders, case variants) into one ---
+if (cmd === 'merge') {
+  const cfg = F.readJson(F.FILES.projects, {}) || {};
+  cfg.aliases = cfg.aliases || {};
+  const names = pos.slice(1), into = flag('--into', null);
+  if (names.length && into == null) die('usage: puffr-sessions merge <name>... --into <project>', 2);
+  for (const n of names) {
+    for (const key of Object.keys(cfg.aliases)) if (key.toLowerCase() === n.toLowerCase()) delete cfg.aliases[key];
+    if (into) cfg.aliases[F.clean(n)] = F.clean(into);
+  }
+  if (names.length) F.writePrivate(F.FILES.projects, JSON.stringify(cfg, null, 2) + '\n');
+  const counts = {};
+  const fresh = F.projectNamer(cwds, F.loadProjects());
+  for (const s of all) if (s.state.count) { const n = fresh(F.clean(s.state.cwd), (meta[s.id] || {}).project); counts[n] = (counts[n] || 0) + 1; }
+  const groups = {};
+  for (const [from, to] of Object.entries(cfg.aliases)) (groups[to] = groups[to] || []).push(from);
+  if (!Object.keys(groups).length) console.log('No merged projects. puffr-sessions merge <name>... --into <project>');
+  for (const [to, froms] of Object.entries(groups)) console.log(`  ${to} ← ${froms.join(', ')}  ${C('2', `${counts[to] || 0} sessions`)}`);
+  console.log(C('2', `  saved in ${F.FILES.projects}. Names match case-insensitively.`));
+  return;
+}
+
+// --- metadata commands ---
+if (cmd === 'name' || cmd === 'assign') {
+  const s = resolve(pos[1]);
+  const val = F.clean(pos.slice(2).join(' ')).trim().slice(0, 80);
+  m(s.id)[cmd === 'name' ? 'name' : 'project'] = cmd === 'assign' && val === '-' ? '' : val;
+  tidy(s.id); F.saveMeta(meta);
+  console.log(`${s.id.slice(0, 8)} ${cmd === 'name' ? 'name' : 'project'}: ${val && val !== '-' ? val : '(cleared)'}`);
+  return;
+}
+if (['star', 'unstar', 'archive', 'unarchive'].includes(cmd)) {
+  if (pos.length < 2) die(`usage: puffr-sessions ${cmd} <id>...`, 2);
+  const key = cmd.endsWith('star') ? 'star' : 'archived', on = !cmd.startsWith('un');
+  for (const ref of pos.slice(1)) { const s = resolve(ref); m(s.id)[key] = on; tidy(s.id); console.log(`${s.id.slice(0, 8)} ${cmd}${cmd.endsWith('e') ? 'd' : 'red'}`); }
+  F.saveMeta(meta);
+  return;
+}
+
+// --- save / saved / restore: copies only, never moves or deletes ---
+function copyIfNewer(src, dst) {
+  let a, b;
+  try { a = fs.statSync(src); } catch { return false; }
+  try { b = fs.statSync(dst); } catch {}
+  if (b && b.size === a.size && b.mtimeMs >= a.mtimeMs) return false;
+  fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
+  fs.copyFileSync(src, dst);
+  fs.chmodSync(dst, 0o600);
+  fs.utimesSync(dst, a.atime, a.mtime);
+  return true;
+}
+function copySession(fromFile, toFile) {
+  let n = copyIfNewer(fromFile, toFile) ? 1 : 0;
+  const sdir = fromFile.replace(/\.jsonl$/, '') + '/subagents';
+  let sf = [];
+  try { sf = fs.readdirSync(sdir); } catch {}
+  for (const x of sf) if (copyIfNewer(path.join(sdir, x), path.join(toFile.replace(/\.jsonl$/, ''), 'subagents', x))) n++;
+  return n;
+}
+// Claude saves sit at archive/<project dir>/<id>.jsonl; Codex saves keep their
+// date folders and rollout names under archive/codex/.
+function archived() {
+  const out = [];
+  let files = [];
+  try { files = fs.readdirSync(F.FILES.archive, { recursive: true }).filter(f => f.endsWith('.jsonl') && !/\/subagents\//.test(f)); } catch {}
+  for (const rel of files) {
+    const fp = path.join(F.FILES.archive, rel), codex = rel.startsWith('codex/');
+    const id = codex ? (/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(rel) || [])[1] || path.basename(rel, '.jsonl') : path.basename(rel, '.jsonl');
+    try { out.push({ id, dirName: path.dirname(rel), file: fp, codex, st8: fs.statSync(fp) }); } catch {}
+  }
+  return out;
+}
+
+if (cmd === 'save') {
+  const keep = F.cleanupDays();
+  const expiring = s => now - s.mtime > (keep - 7) * 86400e3;
+  let pick;
+  if (pos.length > 1) pick = pos.slice(1).map(resolve);
+  else {
+    const want = { starred: has('--starred'), expiring: has('--expiring'), all: has('--all') };
+    if (!want.starred && !want.expiring && !want.all) want.starred = want.expiring = true;
+    pick = all.filter(s => want.all || (want.starred && (meta[s.id] || {}).star) || (want.expiring && expiring(s)));
+  }
+  let copied = 0, files = 0;
+  for (const s of pick) {
+    const n = copySession(s.file, path.join(F.FILES.archive, s.dirName, s.harness === 'codex' ? path.basename(s.file) : `${s.id}.jsonl`));
+    if (n) { copied++; files += n; }
+  }
+  console.log(`🐡 saved ${copied} of ${pick.length} session${pick.length === 1 ? '' : 's'} (${files} file${files === 1 ? '' : 's'} copied, the rest already current) to ${F.FILES.archive}`);
+  console.log(C('2', `   Claude Code deletes transcripts after ${keep} days (cleanupPeriodDays). Saved copies are kept until you remove them.`));
+  return;
+}
+if (cmd === 'saved') {
+  const live = new Set(all.map(s => s.id));
+  const rows = archived().sort((a, b) => b.st8.mtimeMs - a.st8.mtimeMs);
+  if (AS_JSON) { console.log(JSON.stringify(rows.map(r => ({ id: r.id, dir: r.dirName, file: r.file, size: r.st8.size, mtime: r.st8.mtimeMs, live: live.has(r.id), name: (meta[r.id] || {}).name || null })), null, 2)); return; }
+  console.log(`🐡 puffr saved sessions: ${rows.length} in ${F.FILES.archive}\n`);
+  for (const r of rows.slice(0, LIMIT)) {
+    const tag = live.has(r.id) ? C('2', 'live   ') : C('33', 'pruned ');
+    console.log(`  ${tag} ${ago(r.st8.mtimeMs).padStart(4)}  ${r.id.slice(0, 8)}  ${F.clean(r.dirName).slice(-30).padEnd(30)}  ${F.clean((meta[r.id] || {}).name || '')}`);
+  }
+  console.log(C('2', '\n  pruned = Claude Code already deleted the original; `puffr-sessions restore <id>` puts it back.'));
+  return;
+}
+if (cmd === 'restore') {
+  const r = String(pos[1] || '').toLowerCase();
+  if (r.length < 6) die('usage: puffr-sessions restore <id> (6+ characters)', 2);
+  const hits = archived().filter(a => a.id.toLowerCase().startsWith(r));
+  if (hits.length !== 1) die(hits.length ? `"${F.clean(pos[1])}" matches ${hits.length} saved sessions` : `no saved session ${F.clean(pos[1])}`, 2);
+  const a = hits[0];
+  const dst = a.codex
+    ? path.join(F.codexHome(), a.dirName.startsWith('codex/archived') ? 'archived_sessions' : 'sessions', a.dirName.replace(/^codex(\/archived)?\/?/, ''), path.basename(a.file))
+    : path.join(F.HOME, '.claude', 'projects', a.dirName, `${a.id}.jsonl`);
+  if (fs.existsSync(dst)) { console.log(`${a.id.slice(0, 8)} is already in ${path.dirname(dst)}; nothing to restore.`); return; }
+  copySession(a.file, dst);
+  console.log(`🐡 restored ${a.id} to ${path.dirname(dst)}\n   resume: ${a.codex ? `codex resume ${a.id}` : `claude --resume ${a.id}  (from the session's project directory)`}`);
+  return;
+}
+
+// --- rows ---
+const clean = F.clean;
+function row(s) {
+  const st = s.state, mm = meta[s.id] || {};
+  const ageMs = now - s.mtime;
+  return {
+    id: s.id, project: clean(st.cwd) || s.decoded, projectName: nameProject(clean(st.cwd), mm.project), file: s.file,
+    mtime: s.mtime, size: s.size, status: ageMs < 60e3 ? 'active' : ageMs < 3600e3 ? 'recent' : 'idle',
+    title: clean(mm.name || st.customTitle || s.title || mm.label || st.aiTitle || st.slug || st.summary),
+    summary: clean(mm.summary || st.summary), messages: st.count, lastTs: st.last,
+    name: mm.name || null, star: !!mm.star, archived: !!mm.archived, cost: Math.round(F.sessionCost(s) * 100) / 100,
+    harness: s.harness || 'claude', resume: s.harness === 'codex' ? `codex resume ${s.id}` : `claude --resume ${s.id}`,
+  };
+}
+
+// --- label: Haiku names and summarizes sessions (opt-in, model.haiku=on) ---
+if (cmd === 'label') {
+  if (F.readConfig()['model.haiku'] !== 'on') die('Haiku labeling is off. Turn it on with: puffr-config set model.haiku on', 3);
+  const todo = all.filter(s => s.state.count && !(meta[s.id] || {}).archived && !(meta[s.id] || {}).label)
+    .sort((a, b) => b.mtime - a.mtime).slice(0, has('--limit') ? LIMIT : 20).map(row);
+  if (!todo.length) { console.log('🐡 every session already has a label.'); return; }
+  // Only titles and first-prompt snippets leave the machine, never transcripts.
+  const lines = todo.map(r => [r.id.slice(0, 8), r.title, r.summary, r.projectName].map(v => clean(v).replace(/\t/g, ' ').slice(0, 120)).join('\t'));
+  const prompt = 'Each line is a coding session: id<TAB>current title<TAB>first prompt<TAB>project.\n'
+    + 'For every line write a name (at most 6 words) and a summary (one sentence, at most 15 words) of what the session was for.\n'
+    + 'Reply with only a JSON object: {"<id>": {"name": "...", "summary": "..."}}\n\n' + lines.join('\n');
+  if (has('--dry-run')) { console.log(prompt); return; }
+  const res = spawnSync('claude', ['-p', '--model', 'haiku', '--no-session-persistence', '--tools', '',
+    '--strict-mcp-config', '--setting-sources', '', '--disable-slash-commands', '--output-format', 'json',
+    '--system-prompt', 'You label coding sessions. Output JSON only.'], { input: prompt, encoding: 'utf8', timeout: 180000 });
+  if (res.error || res.status !== 0) die(`claude -p failed: ${clean((res.error && res.error.message) || res.stderr).slice(0, 200)}`);
+  let out, labels;
+  try { out = JSON.parse(res.stdout); labels = JSON.parse(String(out.result).replace(/^[^{]*/, '').replace(/[^}]*$/, '')); } catch { die('could not parse the Haiku reply'); }
+  let n = 0;
+  for (const r of todo) {
+    const l = labels[r.id.slice(0, 8)];
+    if (!l || typeof l.name !== 'string') continue;
+    Object.assign(m(r.id), { label: clean(l.name).slice(0, 60), summary: clean(l.summary).slice(0, 160) });
+    n++;
+  }
+  F.saveMeta(meta);
+  const usd = Number(out.total_cost_usd);
+  const sp = F.readJson(F.FILES.spend, {}) || {}, h = sp.haiku || { usd: 0, calls: 0 };
+  sp.haiku = { usd: h.usd + (Number.isFinite(usd) ? usd : 0), calls: h.calls + 1 };
+  F.writePrivate(F.FILES.spend, JSON.stringify(sp, null, 1) + '\n');
+  console.log(`🐡 labeled ${n} of ${todo.length} sessions with Haiku${Number.isFinite(usd) ? ` · $${usd.toFixed(4)}` : ''}`);
+  return;
+}
+
+// --- list ---
+const SEARCH = flag('--search', null);
+const SELF = process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || '';
+let rows = all.filter(s => s.state && s.state.count).map(row);
+if (!has('--archived')) rows = rows.filter(r => !r.archived);
+if (has('--starred')) rows = rows.filter(r => r.star);
+if (flag('--tool', null)) rows = rows.filter(r => r.harness === flag('--tool', '').toLowerCase().replace('claude-code', 'claude'));
+if (has('--active')) rows = rows.filter(r => r.status !== 'idle');
+if (SEARCH) rows = rows.filter(r => `${r.title} ${r.summary} ${r.projectName}`.toLowerCase().includes(SEARCH.toLowerCase()));
+rows.sort((a, b) => b.mtime - a.mtime);
+const top = rows.slice(0, LIMIT);
+
+if (AS_JSON) { console.log(JSON.stringify(top, null, 2)); return; }
+
+const DOT = { active: C('32', '●'), recent: C('33', '○'), idle: C('2', '·') };
+const usd = v => v >= 100 ? `$${Math.round(v)}` : `$${v.toFixed(2)}`;
+console.log(`🐡 puffr radar: ${rows.length} sessions${has('--active') ? ' (active/recent)' : ''}, newest ${top.length}:\n`);
+for (const s of top) {
+  const me = s.id === SELF ? C('36', ' ◀ you') : '';
+  const star = (s.harness === 'codex' ? C('35', 'cx ') : '') + (s.star ? C('33', '★ ') : '');
+  console.log(`  ${DOT[s.status]} ${ago(s.mtime).padStart(4)}  ${s.projectName.padEnd(28).slice(0, 28)}  ${String(s.messages).padStart(4)}msg ${(s.harness === 'codex' && !s.cost ? '–' : usd(s.cost)).padStart(7)}  ${star}${s.title.slice(0, 56)}${me}`);
+  console.log(C('2', `         ${s.resume}`));
+}
+console.log(C('2', '\n  ● <1m  ○ <1h  · idle   ★ starred   cx Codex   $ ≈ API list price (Codex: unpriced unless ~/.puffr/prices.json)   fork: claude --resume <id> --fork-session'));
+})();

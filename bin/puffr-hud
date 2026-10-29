@@ -1,0 +1,176 @@
+#!/usr/bin/env node
+// puffr hud — install, check, repair, or remove the HUD statusline.
+//
+// Claude Code only lets plugins ship a subagentStatusLine; the main statusLine
+// is user config holding an absolute path. Plugin updates move the plugin
+// (marketplace installs keep the version in the path), which would strand a
+// path pointing at one copy. So settings point at a stable launcher,
+// ~/.puffr/bin/statusline, and the launcher runs statusline.sh from the puffr
+// copy Claude Code loaded most recently (recorded in ~/.puffr/root by the
+// SessionStart hook). Updates need no re-install.
+//
+// Usage: puffr-hud [status]    what's installed and whether it's healthy
+//        puffr-hud install     launcher + one settings key (backup first)
+//        puffr-hud repair      same as install, then status
+//        puffr-hud remove      drop the settings key (only if it's puffr's) and the launcher
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const HOME = os.homedir();
+const ROOT = path.resolve(__dirname, '..');             // this copy of puffr
+const PUFFR = path.join(HOME, '.puffr');
+const LAUNCHER = path.join(PUFFR, 'bin', 'statusline');
+const ROOT_FILE = path.join(PUFFR, 'root');
+const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+const SETTINGS = path.join(CONFIG_DIR, 'settings.json');
+const cmd = process.argv[2] || 'status';
+
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (c, s) => tty ? `\x1b[${c}m${s}\x1b[0m` : s;
+const ok = s => console.log(`  ${C('32', '✔')} ${s}`);
+const warn = s => console.log(`  ${C('33', '!')} ${s}`);
+const bad = s => console.log(`  ${C('31', '✘')} ${s}`);
+const tilde = p => String(p).replace(HOME, '~');
+const clean = v => String(v == null ? '' : v).replace(/[\x00-\x1f\x7f\u0080-\u009f]/g, ' ');
+
+const version = dir => { try { return JSON.parse(fs.readFileSync(path.join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).version || '?'; } catch { return null; } };
+const readRoot = () => { try { return fs.readFileSync(ROOT_FILE, 'utf8').trim(); } catch { return null; } };
+
+function writePrivate(fp, body, mode) {
+  fs.mkdirSync(path.dirname(fp), { recursive: true, mode: 0o700 });
+  const tmp = `${fp}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body, { mode, flag: 'wx' });
+  fs.renameSync(tmp, fp);
+}
+
+// The launcher itself: tiny, no jq, drains stdin on every failure path so the
+// statusline pipe never stalls.
+function launcherBody() {
+  const q = s => `'${s.replace(/'/g, `'\\''`)}'`;
+  return `#!/bin/bash
+# puffr HUD launcher, installed by /puffr:hud. Settings point here, not at a plugin
+# copy, so plugin updates never strand the HUD: this runs statusline.sh from the
+# puffr copy Claude Code loaded most recently (~/.puffr/root, written each session).
+root=""; read -r root < "$HOME/.puffr/root" 2>/dev/null   # builtin: no fork per render
+[ -n "$root" ] && [ -f "$root/statusline.sh" ] && exec bash "$root/statusline.sh"
+# Fallback: the copy this launcher was installed from.
+fallback=${q(ROOT)}
+[ -f "$fallback/statusline.sh" ] && exec bash "$fallback/statusline.sh"
+cat >/dev/null
+echo "🐡 puffr HUD: plugin not found. Run /puffr:hud repair"
+`;
+}
+
+function readSettings() {
+  if (!fs.existsSync(SETTINGS)) return { obj: {}, real: SETTINGS, existed: false };
+  const real = fs.realpathSync(SETTINGS);                 // a symlinked settings file is edited at its target
+  const txt = fs.readFileSync(real, 'utf8');
+  let obj;
+  try { obj = JSON.parse(txt); } catch { console.error(`puffr-hud: ${tilde(SETTINGS)} is not valid JSON. Not touching it.`); process.exit(1); }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { console.error(`puffr-hud: ${tilde(SETTINGS)} is not a JSON object. Not touching it.`); process.exit(1); }
+  return { obj, real, existed: true, txt };
+}
+
+function writeSettings(s, obj) {
+  if (s.existed) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+    fs.copyFileSync(s.real, `${s.real}.bak.${stamp}`);
+  }
+  const tmp = path.join(path.dirname(s.real), `.settings.json.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { flag: 'wx', mode: s.existed ? fs.statSync(s.real).mode & 0o777 : 0o644 });
+  fs.renameSync(tmp, s.real);
+}
+
+const isPuffrCommand = c => typeof c === 'string' && (c === LAUNCHER || /puffr[^\s]*\/statusline\.sh$/.test(c));
+
+function install() {
+  if (!fs.existsSync(path.join(ROOT, 'statusline.sh'))) { console.error(`puffr-hud: no statusline.sh in ${ROOT}`); process.exit(1); }
+  writePrivate(LAUNCHER, launcherBody(), 0o755);
+  // Seed the root so the HUD works before the next session start records it.
+  if (!readRoot()) writePrivate(ROOT_FILE, ROOT + '\n', 0o600);
+  const s = readSettings();
+  const before = Object.keys(s.obj).length;
+  const prev = s.obj.statusLine;
+  if (prev && prev.command && !isPuffrCommand(prev.command)) {
+    console.error(`puffr-hud: settings already has a different statusLine (${clean(prev.command)}). Remove it first if you want puffr's.`);
+    process.exit(1);
+  }
+  const refresh = prev && Number.isFinite(prev.refreshInterval) ? prev.refreshInterval : 30;
+  s.obj.statusLine = { type: 'command', command: LAUNCHER, refreshInterval: refresh };
+  const after = Object.keys(s.obj).length;
+  // Guard against clobbering: the edit may add statusLine or replace it, nothing else.
+  if (after !== before && after !== before + 1) { console.error('puffr-hud: key count check failed; not writing'); process.exit(1); }
+  writeSettings(s, s.obj);
+  console.log(`🐡 HUD installed: ${tilde(SETTINGS)} → ${tilde(LAUNCHER)}`);
+}
+
+function remove() {
+  const s = readSettings();
+  const c = s.obj.statusLine && s.obj.statusLine.command;
+  if (c && isPuffrCommand(c)) { delete s.obj.statusLine; writeSettings(s, s.obj); console.log(`🐡 statusLine removed from ${tilde(SETTINGS)}`); }
+  else if (c) console.log(`statusLine is not puffr's (${clean(c)}); left alone.`);
+  else console.log('no statusLine set.');
+  try { fs.unlinkSync(LAUNCHER); console.log(`removed ${tilde(LAUNCHER)}`); } catch {}
+  console.log('caches (optional): rm -rf ~/.cache/puffr ~/.puffr');
+}
+
+function otherCopies(live) {
+  const found = [];
+  const cache = path.join(CONFIG_DIR, 'plugins', 'cache');
+  let markets = [];
+  try { markets = fs.readdirSync(cache); } catch {}
+  for (const m of markets) {
+    const pdir = path.join(cache, m, 'puffr');
+    let vers = [];
+    try { vers = fs.readdirSync(pdir); } catch { continue; }
+    for (const v of vers) found.push(path.join(pdir, v));
+  }
+  if (!found.includes(ROOT)) found.push(ROOT);
+  return found.filter(d => path.resolve(d) !== path.resolve(live || ''));
+}
+
+function status() {
+  console.log('🐡 puffr HUD\n');
+  let problems = 0;
+  let s;
+  try { s = readSettings(); } catch (e) { bad(`can't read ${tilde(SETTINGS)}`); process.exit(1); }
+  const c = s.obj.statusLine && s.obj.statusLine.command;
+  if (!c) { bad(`no statusLine in ${tilde(SETTINGS)}. Run: puffr-hud install`); problems++; }
+  else if (c === LAUNCHER) ok(`settings → launcher (${tilde(LAUNCHER)})`);
+  else if (isPuffrCommand(c)) { warn(`settings point at one fixed copy: ${tilde(clean(c))}. Updates won't reach the HUD. Run: puffr-hud repair`); problems++; }
+  else { warn(`statusLine is not puffr's: ${clean(c)}`); problems++; }
+
+  if (c === LAUNCHER && !fs.existsSync(LAUNCHER)) { bad('launcher file missing. Run: puffr-hud repair'); problems++; }
+
+  const live = readRoot();
+  if (!live) { warn('no copy recorded yet (~/.puffr/root); the next session start records it'); }
+  else if (!fs.existsSync(path.join(live, 'statusline.sh'))) { bad(`recorded copy is gone: ${tilde(clean(live))}. Start a new session or run: puffr-hud repair`); problems++; }
+  else ok(`live copy: ${tilde(clean(live))} (v${version(live) || '?'})`);
+
+  const others = otherCopies(live);
+  for (const d of others) {
+    const v = version(d);
+    if (v) console.log(`  ${C('2', '·')} other copy: ${tilde(clean(d))} (v${v})${d.includes(`${path.sep}cache${path.sep}`) ? C('2', '  remove with /plugin if unused') : ''}`);
+  }
+
+  if (fs.existsSync(path.join(PUFFR, 'disabled'))) warn('puffr is muted (/puffr:off). /puffr:on to resume.');
+  let offs = [];
+  try { offs = fs.readFileSync(path.join(PUFFR, 'config'), 'utf8').split('\n').filter(l => /=\s*off\s*$/.test(l)).map(l => l.split('=')[0].trim()); } catch {}
+  if (offs.length) console.log(`  ${C('2', '·')} switched off: ${offs.map(clean).join(', ')} (/puffr:settings)`);
+  let layout = 'compact';
+  try { const m = /^\s*layout\s*=\s*([A-Za-z0-9_-]+)\s*$/m.exec(fs.readFileSync(path.join(PUFFR, 'config'), 'utf8')); if (m) layout = m[1]; } catch {}
+  console.log(`  ${C('2', '·')} layout: ${layout}${process.env.PUFFR_LAYOUT ? ` (PUFFR_LAYOUT=${clean(process.env.PUFFR_LAYOUT)} here)` : ''} (/puffr:layout)`);
+  console.log(problems ? `\n  ${problems} problem${problems > 1 ? 's' : ''}.` : '\n  healthy.');
+  return problems;
+}
+
+if (cmd === 'install') install();
+else if (cmd === 'repair') {
+  // Repair also re-points the recorded copy at this one, which is the copy the user just ran.
+  writePrivate(ROOT_FILE, ROOT + '\n', 0o600);
+  install(); console.log(''); status();
+} else if (cmd === 'remove' || cmd === 'uninstall') remove();
+else if (cmd === 'status') process.exit(status() ? 1 : 0);
+else { console.error('usage: puffr-hud [status|install|repair|remove]'); process.exit(2); }

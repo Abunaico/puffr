@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+// puffr instructions: what each always-on instruction source costs you.
+// Usage: puffr-instructions [--days N] [--project <substr>] [--top N] [--json]
+'use strict';
+const { analyze, adviceFor } = require('../lib/instructions');
+
+const args = process.argv.slice(2);
+const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 && i + 1 < args.length ? args[i + 1] : d; };
+const days = Math.max(1, parseInt(flag('--days', '30'), 10) || 30);
+const top = Math.max(1, parseInt(flag('--top', '12'), 10) || 12);
+const r = analyze({ days, project: flag('--project', null) });
+
+if (args.includes('--json')) {
+  console.log(JSON.stringify({ ...r, rows: r.rows.map(x => ({ ...x, advice: adviceFor(x) })) }, null, 1));
+  process.exit(0);
+}
+
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (c, s) => (tty ? `\x1b[${c}m${s}\x1b[0m` : s);
+const usd = n => `$${n >= 100 ? Math.round(n).toLocaleString() : n.toFixed(2)}`;
+const k = n => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
+const fit = (s, n) => (s.length > n ? '…' + s.slice(-(n - 1)) : s.padEnd(n));
+
+console.log(`${C('1', '🐡 PUFFR instructions')} ${C('2', `· last ${days} days · ${r.sessions} sessions · ${r.requests.toLocaleString()} requests`)}`);
+if (!r.rows.length) { console.log(C('2', '\n  No instruction sources found in this window.')); process.exit(0); }
+console.log(`\n  Always-on instructions cost ${C('1', usd(r.totalUsd))} over ${days} days, ${C('1', `≈${usd(r.monthlyUsd)}/mo`)}, re-read on every request.`);
+console.log(C('2', '  ≈ chars/4 tokens · cache-read price per request carried, plus one cache write · API list price\n'));
+console.log(C('2', `  ${'SOURCE'.padEnd(58)} ${'SIZE'.padStart(6)} ${'IN'.padStart(6)} ${'CARRIED'.padStart(9)} ${'≈/MO'.padStart(9)}`));
+for (const x of r.rows.slice(0, top)) {
+  console.log(`  ${fit(x.label, 58)} ${k(x.tokens).padStart(6)} ${String(x.injections).padStart(6)} ${k(x.carried).padStart(9)} ${C('33', usd(x.monthlyUsd).padStart(9))}`);
+}
+const lead = r.rows[0];
+console.log(`\n  ${C('1', 'First move:')} ${lead.label}`);
+console.log(`  ${adviceFor(lead)}`);
+console.log(C('2', '\n  SIZE = tokens per injection · IN = times injected · CARRIED = requests it sat in context for'));

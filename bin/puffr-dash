@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// puffr-dash: live terminal panel for a split pane (Warp, iTerm, tmux).
+// Usage: puffr-dash [--project <substr>] [--every <seconds>] [--once]
+//                   [--ucef] [--ucef-data-dir <dir>] [--ucef-session <id>] [--ucef-no-redact]
+// `puffr-dash --help` lists the flags and keys; --ucef opens the read-only UCEF monitor view.
+require('../panel/tui.js');

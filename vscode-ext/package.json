@@ -1,0 +1,109 @@
+{
+  "name": "puffr",
+  "displayName": "🐡 Puffr Status",
+  "description": "Shows Claude Code context usage (via puffr) in the VS Code status bar for the official Claude Code extension.",
+  "version": "0.1.0",
+  "publisher": "abunaico",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "puffr",
+          "title": "Puffr",
+          "icon": "icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "puffr": [
+        {
+          "type": "webview",
+          "id": "puffrSidebarView",
+          "name": "🐡 Dashboard"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "puffr.openDashboard",
+        "title": "Open Dashboard",
+        "category": "🐡 Puffr"
+      },
+      {
+        "command": "puffr.showDetail",
+        "title": "Show Context Detail",
+        "category": "🐡 Puffr"
+      },
+      {
+        "command": "puffr.refresh",
+        "title": "Refresh Now",
+        "category": "🐡 Puffr"
+      }
+    ],
+    "configuration": {
+      "title": "Puffr Status",
+      "properties": {
+        "puffr.pollIntervalSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "description": "How often to refresh context usage, in seconds."
+        },
+        "puffr.puffrContextPath": {
+          "type": "string",
+          "default": "puffr-context",
+          "description": "Path to the puffr-context binary. Default assumes it is on PATH."
+        },
+        "puffr.puffrBurnPath": {
+          "type": "string",
+          "default": "puffr-burn",
+          "description": "Path to the puffr-burn binary. Default assumes it is on PATH."
+        },
+        "puffr.showCost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show today's estimated cost for this workspace next to context usage."
+        },
+        "puffr.costPollIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 15,
+          "description": "How often to refresh cost, in seconds. Cost scans more data than context, so this defaults slower."
+        },
+        "puffr.puffrAccountsPath": {
+          "type": "string",
+          "default": "puffr-accounts",
+          "description": "Path to the puffr-accounts binary. Default assumes it is on PATH."
+        },
+        "puffr.puffrSessionsPath": {
+          "type": "string",
+          "default": "puffr-sessions",
+          "description": "Path to the puffr-sessions binary. Default assumes it is on PATH."
+        },
+        "puffr.theme": {
+          "type": "string",
+          "enum": [
+            "puffr",
+            "editor"
+          ],
+          "default": "puffr",
+          "enumDescriptions": [
+            "puffr's arcade look (sky, navy, amber), same as the puffr-burn HTML report",
+            "Blend in with your VS Code color theme"
+          ],
+          "description": "Dashboard style."
+        }
+      }
+    }
+  }
+}

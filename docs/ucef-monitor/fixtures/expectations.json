@@ -1,0 +1,57 @@
+{
+  "normal-session.jsonl": {
+    "lines": 50,
+    "invalid_lines": [],
+    "collapsed_rows": 50
+  },
+  "dedupe-cases.jsonl": {
+    "lines": 10,
+    "invalid_lines": [],
+    "cases": {
+      "a": {
+        "rows": 1,
+        "winner_provenance": "emitted"
+      },
+      "b": {
+        "rows": 2
+      },
+      "c": {
+        "rows": 2
+      },
+      "e": {
+        "rows": 1,
+        "phase_status": {
+          "4": "seen",
+          "5": "pending"
+        }
+      },
+      "g": {
+        "rows": 1,
+        "winner_provenance": "emitted"
+      }
+    }
+  },
+  "raw/s1-orphan-agents.jsonl": {
+    "kind": "raw",
+    "lines": 5,
+    "agent_rows": {
+      "a7000000000000001": "succeeded"
+    }
+  },
+  "degraded-db.jsonl": {
+    "lines": 8,
+    "invalid_lines": []
+  },
+  "secret-bearing.jsonl": {
+    "lines": 7,
+    "invalid_lines": []
+  },
+  "unknown-schema-version.jsonl": {
+    "lines": 4,
+    "invalid_lines": [
+      2,
+      3,
+      4
+    ]
+  }
+}

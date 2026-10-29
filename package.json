@@ -1,0 +1,38 @@
+{
+  "name": "@abunaico/puffr",
+  "version": "0.10.0",
+  "description": "🐡 PUFFR installer: context, cost & fleet HUD for Claude Code. Installs the plugin from the puffr-tools marketplace, wires the HUD, and adds the VS Code panel and Warp side pane.",
+  "bin": {
+    "puffr": "bin/puffr-install"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "panel/",
+    "vscode-ext/",
+    "assets/puffr-flat.png",
+    "assets/puffr-puff.png",
+    ".claude-plugin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "statusline",
+    "plugin",
+    "vscode",
+    "warp",
+    "puffr"
+  ],
+  "homepage": "https://github.com/Abunaico/puffr",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abunaico/puffr.git"
+  },
+  "author": "Anthony Shafer",
+  "license": "SEE LICENSE IN LICENSE"
+}

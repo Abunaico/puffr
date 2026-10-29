@@ -1,0 +1,19 @@
+{
+  "description": "Normative redaction conformance vectors for UCEF Monitor Event Contract v1 (spec.md section 7). Inputs are synthetic and assembled by concatenating input_parts so that no secret-shaped string exists contiguously on disk. A conforming scrubber, followed by control-character stripping, MUST produce exactly `expected` and report exactly the classes in `classes`. Scrubbers MAY over-redact beyond these vectors but MUST NOT under-redact them.",
+  "pipeline": ["scrub (classes applied in listed order)", "strip_controls (tab/newline/CR to space; drop other C0 and C1)", "truncate (after scrub, never inside a [REDACTED:...] token)"],
+  "class_order": ["private_key", "jwt", "api_key", "github_token", "aws_key_id", "bearer", "url_userinfo", "env_assignment"],
+  "vectors": [
+    { "name": "api_key_in_env_export", "input_parts": ["export OPENAI_API_KEY=", "sk-", "FAKE0123456789", "abcdefghij", " && run"], "expected": "export OPENAI_API_KEY=[REDACTED:api_key] && run", "classes": ["api_key"] },
+    { "name": "github_token", "input_parts": ["token ", "ghp_", "FAKEFAKEFAKEFAKEFAKEFAKE1234"], "expected": "token [REDACTED:github_token]", "classes": ["github_token"] },
+    { "name": "aws_key_id", "input_parts": ["id ", "AKIA", "FAKEFAKEFAKE1234"], "expected": "id [REDACTED:aws_key_id]", "classes": ["aws_key_id"] },
+    { "name": "jwt", "input_parts": ["eyJ", "hbGciOiJIUzI1NiJ9", ".", "eyJzdWIiOiJmYWtlIn0K", ".", "c2lnbmF0dXJl"], "expected": "[REDACTED:jwt]", "classes": ["jwt"] },
+    { "name": "bearer_header", "input_parts": ["Authorization: Bearer ", "FAKEtokenFAKEtoken1234"], "expected": "Authorization: Bearer [REDACTED:bearer]", "classes": ["bearer"] },
+    { "name": "url_userinfo", "input_parts": ["https://deploy:", "FAKEpass99", "@git.example.invalid/r.git"], "expected": "https://[REDACTED:url_userinfo]@git.example.invalid/r.git", "classes": ["url_userinfo"] },
+    { "name": "private_key_block", "input_parts": ["-----BEGIN RSA ", "PRIVATE KEY-----\nMIIFAKEBODY\n-----END RSA ", "PRIVATE KEY-----"], "expected": "[REDACTED:private_key]", "classes": ["private_key"] },
+    { "name": "env_assignment_password", "input_parts": ["DB_PASSWORD=", "hunter2hunter2"], "expected": "DB_PASSWORD=[REDACTED:env_assignment]", "classes": ["env_assignment"] },
+    { "name": "escape_sequence_stripped", "input_parts": ["done\u001b]777;notify;x\u0007 ok"], "expected": "done]777;notify;x ok", "classes": [] },
+    { "name": "accepted_over_redaction", "input_parts": ["Tests incomplete; token: refreshed"], "expected": "Tests incomplete; token: [REDACTED:env_assignment]", "classes": ["env_assignment"] },
+    { "name": "task_prefix_not_api_key", "input_parts": ["agent ucef-core:meta:ta", "sk-decomposition-expert finished"], "expected": "agent ucef-core:meta:task-decomposition-expert finished", "classes": [] },
+    { "name": "clean_text_untouched", "input_parts": ["Staged diff matches the stated change."], "expected": "Staged diff matches the stated change.", "classes": [] }
+  ]
+}

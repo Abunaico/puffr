@@ -1,0 +1,113 @@
+#!/usr/bin/env node
+// puffr accounts — every Claude Code login on this machine, with its last-known
+// 5h/7d usage, side by side. No tokens, no API calls: usage comes from what the
+// HUD saw on its last render for that account, or from Claude Code's own
+// cached utilization in the profile's .claude.json, whichever is newer.
+//
+// Profiles: the default config (~/.claude.json), $CLAUDE_CONFIG_DIR, every dir
+// under ~/.aimux/profiles and ~/.claude-profiles, plus $PUFFR_PROFILE_DIRS
+// (colon-separated; each entry is a profile dir or a dir of profile dirs).
+//
+// Usage: puffr-accounts [--json]
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+
+const HOME = os.homedir();
+const AS_JSON = process.argv.includes('--json');
+const CACHE = path.join(process.env.XDG_CACHE_HOME || path.join(HOME, '.cache'), 'puffr');
+const ACTIVE_DIR = path.resolve(process.env.CLAUDE_CONFIG_DIR || HOME);
+const now = Date.now() / 1000;
+
+const clean = v => String(v == null ? '' : v).replace(/[\x00-\x1f\x7f\u0080-\u009f]/g, ' ');
+const readJson = fp => { try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; } };
+
+// cksum(1) of the email, matching the HUD's usage-<cksum> file name.
+const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n << 24; for (let k = 0; k < 8; k++) c = c & 0x80000000 ? (c << 1) ^ 0x04c11db7 : c << 1; t.push(c >>> 0); } return t; })();
+function cksum(str) {
+  const b = Buffer.from(str, 'utf8');
+  let c = 0;
+  for (const x of b) c = ((c << 8) ^ CRC[((c >>> 24) ^ x) & 0xff]) >>> 0;
+  for (let len = b.length; len > 0; len = Math.floor(len / 256)) c = ((c << 8) ^ CRC[((c >>> 24) ^ (len & 0xff)) & 0xff]) >>> 0;
+  return (~c) >>> 0;
+}
+
+const isoToEpoch = v => {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v > 1e12 ? Math.floor(v / 1000) : v;
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+};
+
+function usageFor(email, cfg) {
+  const cands = [];
+  const hud = readJson(path.join(CACHE, `usage-${cksum(email)}`));
+  if (hud && hud.email === email && typeof hud.v === 'string') {
+    const [h5, h5r, d7, d7r] = hud.v.split('|');
+    cands.push({ source: 'hud', at: hud.at, h5: parseFloat(h5), h5r: +h5r || null, d7: parseFloat(d7), d7r: +d7r || null });
+  }
+  const cu = cfg && cfg.cachedUsageUtilization;
+  const acctUuid = cfg && cfg.oauthAccount && cfg.oauthAccount.accountUuid;
+  if (cu && cu.utilization && (!cu.accountUuid || cu.accountUuid === acctUuid)) {
+    const f = cu.utilization.five_hour || {}, s = cu.utilization.seven_day || {};
+    cands.push({ source: 'claude', at: (cu.fetchedAtMs || 0) / 1000, h5: f.utilization, h5r: isoToEpoch(f.resets_at),
+      d7: s.utilization, d7r: isoToEpoch(s.resets_at) });
+  }
+  if (!cands.length) return null;
+  cands.sort((a, b) => (b.at || 0) - (a.at || 0));
+  // Per window, the newest reading that actually has a value (the HUD may only
+  // have seen 5h, while Claude Code's own cache still holds 7d).
+  const u = { at: cands[0].at, source: cands[0].source };
+  for (const [p, r] of [['h5', 'h5r'], ['d7', 'd7r']]) {
+    const c = cands.find(x => Number.isFinite(x[p]));
+    u[p] = c ? c[p] : null; u[r] = c ? c[r] : null; u[`${p}At`] = c ? c.at : null;
+    // A window that reset since the reading is back to zero, whatever was recorded.
+    if (u[p] != null && u[r] && u[r] <= now) { u[p] = 0; u[r] = null; }
+  }
+  return u;
+}
+
+const rows = [];
+for (const { dir, label, cfg } of require('../lib/puffr.js').profiles()) {
+  const oa = cfg.oauthAccount || {};
+  const email = clean(oa.emailAddress);
+  rows.push({
+    profile: clean(label), dir, active: dir === ACTIVE_DIR,
+    email: email || null, plan: clean((oa.organizationType || '').replace(/^claude_/, '')) || null,
+    org: clean(oa.organizationName) || null,
+    usage: email ? usageFor(oa.emailAddress, cfg) : null,
+  });
+}
+
+if (AS_JSON) { console.log(JSON.stringify(rows, null, 2)); process.exit(0); }
+
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (code, s) => tty ? `\x1b[${code}m${s}\x1b[0m` : s;
+const dim = s => C('2', s);
+const vpad = (s, n) => s + ' '.repeat(Math.max(0, n - s.replace(/\x1b\[[0-9;]*m/g, '').length));
+const dur = s => s < 60 ? '<1m' : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400
+  ? `${Math.floor(s / 3600)}h${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}m` : `${Math.floor(s / 86400)}d${Math.floor(s % 86400 / 3600)}h`;
+function meter(p, reset) {
+  if (p == null) return vpad(dim('   —'), 20);
+  const v = Math.round(p), col = v >= 85 ? '31' : v >= 60 ? '33' : '32';
+  const n = Math.max(0, Math.min(6, Math.round(v / 100 * 6)));
+  const bar = C(col, '█'.repeat(n)) + dim('░'.repeat(6 - n));
+  const r = reset && reset > now ? dim(`⏰${dur(reset - now)}`) : '';
+  return vpad(`${bar} ${C(col, `${v}%`.padStart(4))} ${r}`, 20);
+}
+
+console.log(`🐡 puffr accounts — ${rows.length} profile${rows.length === 1 ? '' : 's'}\n`);
+const w = Math.max(10, ...rows.map(r => (r.email || '(not logged in)').length));
+for (const r of rows) {
+  const mark = r.active ? C('36', '●') : ' ';
+  const who = (r.email || '(not logged in)').padEnd(w);
+  const plan = (r.plan || '').padEnd(10);
+  const u = r.usage;
+  const seen = u ? dim(`${dur(Math.max(0, now - u.at))} ago`) : dim('never seen');
+  console.log(`  ${mark} ${who}  ${plan} 5h ${meter(u && u.h5, u && u.h5r)} 7d ${meter(u && u.d7, u && u.d7r)} ${seen}  ${dim(r.profile)}`);
+}
+const others = rows.filter(r => !r.active && r.dir !== path.resolve(HOME));
+console.log(dim(`\n  ● this session. Usage is the last reading the HUD or Claude Code saw; a window that has reset shows 0%.`));
+if (others.length) console.log(dim(`  launch another: CLAUDE_CONFIG_DIR=${clean(others[0].dir.replace(HOME, '~'))} claude`));

@@ -1,0 +1,353 @@
+#!/usr/bin/env node
+// puffr context + cache viewer — what is filling a session's context window,
+// and how well the prompt cache is holding.
+//
+// Everything comes from the session transcript: per-request usage
+// (input / cache_read / cache_creation 5m+1h / output) is measured; the
+// per-category breakdown is a char-count estimate scaled to the measured total.
+//
+// Usage: puffr-context [session-id | path.jsonl] [--project <substr>] [--json]
+//                     [--turns N] [--top N] [--window TOKENS]
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const args = process.argv.slice(2);
+const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 && i + 1 < args.length ? args[i + 1] : d; };
+const num = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 ? n : d; };
+const AS_JSON = args.includes('--json');
+const TURNS = num(flag('--turns'), 12);
+const TOP = num(flag('--top'), 8);
+const WINDOW_ARG = num(flag('--window'), 0);
+const PROJ_FILTER = flag('--project', null);
+const VALUED = new Set(['--turns', '--top', '--window', '--project']);
+const positional = args.filter((a, i) => !a.startsWith('--') && !VALUED.has(args[i - 1]))[0];
+
+const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const ROOT = path.join(CONFIG_DIR, 'projects');
+const WIN_CACHE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'puffr');
+const SELF = process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || '';
+const IMAGE_TOKENS = 1600;  // images are billed by pixel area, not base64 length
+
+const clean = v => String(v == null ? '' : v).replace(/[\x00-\x1f\x7f\u0080-\u009f]/g, ' ');
+// Transcript numbers are untrusted too: a string there must not reach output raw.
+const n0 = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+const die = m => { console.error(`puffr-context: ${m}`); process.exit(1); };
+
+function findTranscript() {
+  if (positional && positional.endsWith('.jsonl')) return positional;
+  const want = positional || (PROJ_FILTER ? null : SELF);
+  let best = null;
+  let dirs = [];
+  try { dirs = fs.readdirSync(ROOT); } catch { die(`no ${ROOT}`); }
+  for (const d of dirs) {
+    if (PROJ_FILTER && !d.toLowerCase().includes(PROJ_FILTER.toLowerCase().replace(/[/_]/g, '-'))) continue;
+    if (want) {
+      const fp = path.join(ROOT, d, `${want}.jsonl`);
+      if (fs.existsSync(fp)) return fp;
+      continue;
+    }
+    let files = [];
+    try { files = fs.readdirSync(path.join(ROOT, d)).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+    for (const f of files) {
+      const fp = path.join(ROOT, d, f);
+      try { const m = fs.statSync(fp).mtimeMs; if (!best || m > best.m) best = { fp, m }; } catch {}
+    }
+  }
+  if (want) die(`session ${clean(want)} not found under ${ROOT}`);
+  if (!best) die('no transcripts found');
+  return best.fp;
+}
+
+// Streamed line reader — transcripts run to hundreds of MB.
+function eachLine(fp, fn) {
+  const fd = fs.openSync(fp, 'r');
+  try {
+    const buf = Buffer.alloc(1 << 20);
+    let carry = Buffer.alloc(0), n;
+    while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+      const chunk = Buffer.concat([carry, buf.subarray(0, n)]);
+      let start = 0;
+      for (let i = chunk.indexOf(0x0a); i !== -1; i = chunk.indexOf(0x0a, start)) {
+        if (i > start) fn(chunk.toString('utf8', start, i));
+        start = i + 1;
+      }
+      carry = Buffer.from(chunk.subarray(start));
+    }
+    if (carry.length) fn(carry.toString('utf8'));
+  } finally { fs.closeSync(fd); }
+}
+
+// ~4 characters per token: rough, but every estimate is rescaled to measured usage.
+const est = s => Math.ceil((typeof s === 'string' ? s.length : JSON.stringify(s || '').length) / 4);
+
+function resultTokens(content) {
+  if (typeof content === 'string') return est(content);
+  if (!Array.isArray(content)) return est(content);
+  let t = 0;
+  for (const p of content) t += p && p.type === 'image' ? IMAGE_TOKENS : est(p && p.text != null ? p.text : p);
+  return t;
+}
+
+function toolLabel(name, input) {
+  const i = input || {};
+  const v = i.command || i.file_path || i.path || i.pattern || i.url || i.description || i.query || i.skill
+    || Object.values(i).find(x => typeof x === 'string') || '';
+  return clean(v).replace(/\s+/g, ' ').trim();
+}
+
+// Attachment fields that actually carry injected text; the rest is metadata.
+function attachmentTokens(a) {
+  if (!a || typeof a !== 'object') return 0;
+  const body = a.content ?? a.snippet ?? a.addedLines ?? a.entries ?? a.snapshot ?? null;
+  return body == null ? 0 : est(body);
+}
+
+function usageTotal(u) {
+  return n0(u.input_tokens) + n0(u.cache_read_input_tokens) + n0(u.cache_creation_input_tokens);
+}
+
+function parse(fp) {
+  const S = {
+    file: fp, title: null, model: null, cwd: null,
+    reqs: new Map(),         // message.id → request (streamed blocks repeat usage; last wins)
+    tools: new Map(),        // tool_use_id → {name, label}
+    items: [],               // context contributors since the last compaction
+    compactions: [], firstCtxEst: 0, seenAssistant: false,
+  };
+  let preserved = new Set();
+  const addItem = (cat, tok, label, ts, uuid) => { if (tok > 0) S.items.push({ cat, tok, label, ts, uuid }); };
+
+  eachLine(fp, line => {
+    let e;
+    try { e = JSON.parse(line); } catch { return; }
+    if (!e || typeof e !== 'object') return;
+    if (!S.cwd && typeof e.cwd === 'string') S.cwd = clean(e.cwd);
+    if (e.type === 'custom-title' && e.customTitle) S.title = e.customTitle;
+    else if (e.type === 'ai-title' && e.aiTitle && !S.title) S.title = e.aiTitle;
+    // Sidechain entries are subagent turns; they never enter this session's context.
+    if (e.isSidechain) return;
+
+    if (e.type === 'system' && e.subtype === 'compact_boundary') {
+      const m = e.compactMetadata || {};
+      S.compactions.push({ ts: e.timestamp, trigger: clean(m.trigger || '?'), pre: n0(m.preTokens), post: n0(m.postTokens) });
+      preserved = new Set((m.preservedMessages && m.preservedMessages.allUuids) || []);
+      S.items = S.items.filter(it => it.uuid && preserved.has(it.uuid));
+      return;
+    }
+
+    const ts = e.timestamp;
+    const msg = e.message || {};
+    if (e.type === 'assistant') {
+      if (msg.id && msg.usage) {
+        const model = msg.model == null ? null : clean(msg.model);
+        S.reqs.set(msg.id, { id: msg.id, ts, model, u: msg.usage, afterCompact: S.compactions.length });
+        if (model && model !== '<synthetic>') S.model = model;
+      }
+      S.seenAssistant = true;
+      for (const b of Array.isArray(msg.content) ? msg.content : []) {
+        if (b.type === 'text') addItem('assistant text', est(b.text), null, ts, e.uuid);
+        else if (b.type === 'tool_use') {
+          const label = toolLabel(b.name, b.input);
+          S.tools.set(b.id, { name: clean(b.name), label });
+          addItem('tool calls', est(b.input), `${clean(b.name)} ${label}`, ts, e.uuid);
+        }
+        // thinking: prior-turn thinking is stripped by the API, so it is not context
+      }
+      return;
+    }
+
+    let tok = 0;
+    if (e.type === 'user') {
+      const c = msg.content;
+      if (e.isCompactSummary) addItem('compact summary', tok = est(c), null, ts, e.uuid);
+      else if (typeof c === 'string') addItem(e.isMeta ? 'skills & meta' : 'user prompts', tok = est(c), null, ts, e.uuid);
+      else if (Array.isArray(c)) {
+        for (const p of c) {
+          if (p.type === 'tool_result') {
+            const t = S.tools.get(p.tool_use_id) || { name: '?', label: '' };
+            const r = resultTokens(p.content);
+            tok += r;
+            addItem(`result: ${t.name}`, r, `${t.name} ${t.label}`, ts, e.uuid);
+          } else if (p.type === 'image') { tok += IMAGE_TOKENS; addItem('user prompts', IMAGE_TOKENS, 'image', ts, e.uuid); }
+          else { const r = est(p.text != null ? p.text : p); tok += r; addItem(e.isMeta ? 'skills & meta' : 'user prompts', r, null, ts, e.uuid); }
+        }
+      }
+    } else if (e.type === 'attachment') {
+      tok = attachmentTokens(e.attachment);
+      addItem('hooks & attachments', tok, clean(e.attachment && e.attachment.type), ts, e.uuid);
+    }
+    if (!S.seenAssistant) S.firstCtxEst += tok;
+  });
+  return S;
+}
+
+function analyze(S) {
+  const reqs = [...S.reqs.values()].filter(r => r.model !== '<synthetic>');
+  const turns = reqs.map(r => {
+    const u = r.u, cc = u.cache_creation || {};
+    let w1h = n0(cc.ephemeral_1h_input_tokens), w5 = n0(cc.ephemeral_5m_input_tokens);
+    const write = n0(u.cache_creation_input_tokens);
+    // Transcripts without the 5m/1h split (or with a partial one): the rest is 5m.
+    if (w1h + w5 !== write) { w5 = write - w1h; if (w5 < 0) { w5 = 0; w1h = write; } }
+    return { ts: r.ts, model: r.model, input: n0(u.input_tokens), read: n0(u.cache_read_input_tokens),
+      w5, w1h, write, output: n0(u.output_tokens), ctx: usageTotal(u), compactsBefore: r.afterCompact };
+  });
+
+  // Cache breaks: a request that re-wrote a big slice of the prefix instead of reading it.
+  // Every turn writes its own new tail, so small writes are normal and skipped.
+  const breaks = [];
+  turns.forEach((t, i) => {
+    if (t.write < Math.max(10000, 0.3 * t.ctx)) return;
+    const p = turns[i - 1];
+    let reason;
+    if (!p) reason = 'cold start';
+    else {
+      const gap = (Date.parse(t.ts) - Date.parse(p.ts)) / 1000;
+      const ttl = (p.w1h > 0 || t.w1h > 0) ? 3600 : 300;
+      if (Number.isFinite(gap) && gap > ttl) reason = `TTL expired (idle ${fmtDur(gap)}, ${ttl === 3600 ? '1h' : '5m'} cache)`;
+      else if (t.compactsBefore > p.compactsBefore) reason = 'compaction';
+      else if (p.model && t.model && p.model !== t.model) reason = `model switch ${p.model} → ${t.model}`;
+      else reason = 'prefix changed (system prompt, tools, or earlier message edited)';
+    }
+    breaks.push({ ts: t.ts, write: t.write, ctx: t.ctx, reason });
+  });
+
+  const sum = k => turns.reduce((a, t) => a + t[k], 0);
+  const tot = { input: sum('input'), read: sum('read'), w5: sum('w5'), w1h: sum('w1h'), output: sum('output') };
+  const allIn = tot.input + tot.read + tot.w5 + tot.w1h;
+  // Input-price multipliers: read 0.1×, 5m write 1.25×, 1h write 2×, uncached 1×.
+  const weighted = tot.read * 0.1 + tot.w5 * 1.25 + tot.w1h * 2 + tot.input;
+  const cache = {
+    requests: turns.length, ...tot,
+    hitRate: allIn ? tot.read / allIn : 0,
+    costVsUncached: allIn ? weighted / allIn : 0,
+    breaks,
+  };
+
+  // Context composition: estimates scaled so they add up to the measured window.
+  const last = turns[turns.length - 1];
+  const current = last ? last.ctx : 0;
+  const baseline = turns.length ? Math.max(0, turns[0].ctx - S.firstCtxEst) : 0;
+  const cats = new Map();
+  for (const it of S.items) cats.set(it.cat, (cats.get(it.cat) || 0) + it.tok);
+  const estSum = [...cats.values()].reduce((a, b) => a + b, 0);
+  const measured = Math.max(0, current - baseline);
+  const scale = estSum > 0 && measured > 0 ? measured / estSum : 1;
+  const composition = [{ cat: 'system prompt + tools', tok: Math.min(baseline, current), measured: true }]
+    .concat([...cats].map(([cat, tok]) => ({ cat, tok: Math.round(tok * scale) })))
+    .filter(c => c.tok > 0).sort((a, b) => b.tok - a.tok);
+  const top = S.items.filter(it => it.label && it.cat !== 'hooks & attachments')
+    .sort((a, b) => b.tok - a.tok).slice(0, TOP)
+    .map(it => ({ tok: Math.round(it.tok * scale), cat: it.cat, label: it.label.slice(0, 90), ts: it.ts }));
+
+  let win = WINDOW_ARG, winSource = '--window';
+  if (!win) {
+    const sid = path.basename(S.file, '.jsonl').replace(/[^A-Za-z0-9-]/g, '');
+    try { win = num(fs.readFileSync(path.join(WIN_CACHE, `win-${sid}`), 'utf8').trim(), 0); winSource = 'statusline'; } catch {}
+  }
+  if (!win) { win = turns.some(t => t.ctx > 200000) ? 1000000 : 200000; winSource = 'assumed'; }
+  const acPct = num(process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, 0);
+
+  return {
+    session: path.basename(S.file, '.jsonl'), file: S.file, title: clean(S.title), model: S.model, cwd: S.cwd,
+    context: { current, window: win, windowSource: winSource, pct: win ? current / win : 0,
+      autocompactPct: acPct || null, compactions: S.compactions, composition, top, scaled: scale !== 1 },
+    cache, turns: turns.slice(-TURNS),
+  };
+}
+
+function subagents(fp) {
+  const dir = fp.replace(/\.jsonl$/, '') + '/subagents';
+  let files = [];
+  try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch { return []; }
+  return files.map(f => {
+    const reqs = new Map();
+    eachLine(path.join(dir, f), line => {
+      let e; try { e = JSON.parse(line); } catch { return; }
+      if (e && e.type === 'assistant' && e.message && e.message.id && e.message.usage) reqs.set(e.message.id, e.message.usage);
+    });
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(path.join(dir, f.replace(/\.jsonl$/, '.meta.json')), 'utf8')); } catch {}
+    const us = [...reqs.values()];
+    const s = k => us.reduce((a, u) => a + n0(u[k]), 0);
+    return { agent: clean(meta.agentType || f.replace(/\.jsonl$/, '')), description: clean(meta.description || ''),
+      requests: us.length, read: s('cache_read_input_tokens'), write: s('cache_creation_input_tokens'),
+      input: s('input_tokens'), output: s('output_tokens'), peak: us.reduce((m, u) => Math.max(m, usageTotal(u)), 0) };
+  });
+}
+
+function fmtDur(s) { return s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`; }
+const k = n => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e4 ? `${Math.round(n / 1e3)}k` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+const pct = x => `${Math.round(x * 100)}%`;
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (code, s) => tty ? `\x1b[${code}m${s}\x1b[0m` : s;
+const dim = s => C('2', s), bold = s => C('1', s);
+const hhmm = ts => { const d = new Date(ts); return isNaN(d) ? '--:--' : d.toTimeString().slice(0, 5); };
+function bar(frac, width = 30) {
+  const f = Math.max(0, Math.min(1, frac)), n = Math.round(f * width);
+  const col = f >= 0.9 ? '31' : f >= 0.7 ? '33' : '32';
+  return C(col, '█'.repeat(n)) + dim('░'.repeat(width - n));
+}
+
+const R = analyze(parse(findTranscript()));
+const subs = subagents(R.file);
+
+if (AS_JSON) { console.log(JSON.stringify({ ...R, subagents: subs }, null, 2)); process.exit(0); }
+
+const out = [];
+const cx = R.context, ca = R.cache;
+out.push(`🐡 puffr context — ${bold(R.title || R.session)}${R.session === SELF ? C('36', ' ◀ you') : ''}`);
+out.push(dim(`   ${R.model || '?'} · ${R.cwd || '?'} · ${R.session}`));
+out.push('');
+out.push(bold('CONTEXT'));
+const wnote = cx.windowSource === 'assumed' ? ' (window assumed; pass --window)' : '';
+out.push(`  ${bar(cx.pct)} ${k(cx.current)} / ${k(cx.window)}  ${bold(pct(cx.pct))}${dim(wnote)}`);
+if (cx.autocompactPct) {
+  const left = Math.round(cx.window * cx.autocompactPct / 100) - cx.current;
+  out.push(dim(`  autocompact at ${cx.autocompactPct}% · ${left > 0 ? `${k(left)} to go` : 'threshold passed'}`));
+}
+if (cx.compactions.length) {
+  const c = cx.compactions[cx.compactions.length - 1];
+  out.push(dim(`  compacted ${cx.compactions.length}× · last ${hhmm(c.ts)} (${c.trigger}) ${k(c.pre)} → ${k(c.post)}`));
+}
+out.push('');
+const maxCat = Math.max(1, ...cx.composition.map(c => c.tok));
+for (const c of cx.composition.slice(0, 12)) {
+  const share = cx.current ? c.tok / cx.current : 0;
+  out.push(`  ${c.cat.padEnd(24).slice(0, 24)} ${(c.measured ? '' : '≈') .padStart(1)}${k(c.tok).padStart(6)} ${pct(share).padStart(4)} ${bar(c.tok / maxCat, 16)}`);
+}
+if (cx.top.length) {
+  out.push('');
+  out.push(bold('  largest items'));
+  for (const t of cx.top) out.push(`  ${('≈' + k(t.tok)).padStart(7)}  ${dim(hhmm(t.ts))}  ${t.label}`);
+}
+out.push('');
+out.push(bold('CACHE'));
+const hitCol = ca.hitRate >= 0.8 ? '32' : ca.hitRate >= 0.5 ? '33' : '31';
+out.push(`  hit rate ${C(hitCol, bold(pct(ca.hitRate)))} over ${ca.requests} requests · input billed at ${bold(pct(ca.costVsUncached))} of uncached`);
+out.push(`  read ${k(ca.read)} · write ${k(ca.w5 + ca.w1h)} ${dim(`(5m ${k(ca.w5)} / 1h ${k(ca.w1h)})`)} · uncached ${k(ca.input)} · output ${k(ca.output)}`);
+if (ca.breaks.length) {
+  out.push('');
+  out.push(bold(`  cache breaks (${ca.breaks.length})`));
+  for (const b of ca.breaks.slice(-8)) out.push(`  ${dim(hhmm(b.ts))}  ${C('33', 'rewrote ' + k(b.write).padStart(5))}  ${b.reason}`);
+}
+out.push('');
+out.push(dim(`  time     ctx    read   write  uncach  out   hit`));
+for (const t of R.turns) {
+  const hit = t.ctx ? t.read / t.ctx : 0;
+  const hc = hit >= 0.8 ? '32' : hit >= 0.5 ? '33' : '31';
+  out.push(`  ${hhmm(t.ts)} ${k(t.ctx).padStart(6)} ${k(t.read).padStart(7)} ${k(t.write).padStart(7)} ${k(t.input).padStart(7)} ${k(t.output).padStart(5)} ${C(hc, pct(hit).padStart(5))}`);
+}
+if (subs.length) {
+  out.push('');
+  out.push(bold(`SUBAGENTS (${subs.length})`));
+  for (const s of subs.slice(-10)) {
+    const hit = s.read + s.write + s.input ? s.read / (s.read + s.write + s.input) : 0;
+    out.push(`  ${s.agent.slice(0, 40).padEnd(40)} ${String(s.requests).padStart(3)} req · peak ${k(s.peak).padStart(5)} · hit ${pct(hit).padStart(4)}`);
+  }
+}
+out.push('');
+out.push(dim('  ≈ = char-count estimate scaled to the measured total. Prior-turn thinking is excluded (the API drops it).'));
+console.log(out.join('\n'));

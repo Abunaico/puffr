@@ -1,0 +1,9 @@
+# compact: the default. Identity, then every gauge on one line, then the folder.
+#
+# Each "- [...]" is one HUD line; widgets show left to right. Separators like
+# · or | (or any "quoted text") only show when a widget follows them.
+# Every widget name is listed in layouts/README.md.
+lines:
+  - [fish, model, mode, ·, account, plan]
+  - [context-bar, context-pct, 5h, 5h-reset, 5h-pace, 7d, 7d-reset, 7d-pace, cache, ·, cost, nudge]
+  - [dir, ·, git]

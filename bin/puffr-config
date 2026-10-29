@@ -1,0 +1,179 @@
+#!/usr/bin/env node
+// puffr config — turn individual puffr features on and off, and pick the HUD layout.
+// State lives in ~/.puffr/config as `key=off` lines (anything not listed is on)
+// plus one `layout=<name>` line. Every surface reads it on each run, so changes
+// apply on the next render/poll.
+//
+// Usage: puffr-config                       show every feature and its state
+//        puffr-config off <key>...          turn features off (on works the same)
+//        puffr-config on all | off all      everything at once
+//        puffr-config reset                 back to defaults (all on, compact layout)
+//        puffr-config layout                list layouts, active one marked
+//        puffr-config layout <name>         switch the HUD layout
+//        puffr-config layout new <name> [from]   copy a layout to ~/.puffr/layouts to edit
+//        puffr-config --json
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const FEATURES = [
+  ['hud.mode',    'HUD: effort level and output style'],
+  ['hud.git',     'HUD: git branch and dirty flag'],
+  ['hud.account', 'HUD: active Anthropic account'],
+  ['hud.rate',    'HUD: 5h/7d rate-limit meters'],
+  ['hud.reset',   'HUD: reset countdown on the meters (⏰)'],
+  ['hud.pace',    'HUD: pace projection on the meters (→)'],
+  ['hud.cache',   'HUD: prompt-cache countdown'],
+  ['hud.cost',    'HUD: session cost'],
+  ['hud.nudge',   'HUD: "compact before a break" hint on large contexts'],
+  ['hud.fish',    'HUD: the pufferfish (and the skull at 90%)'],
+  ['fleet',       'Subagent fleet rows'],
+  ['banner',      'Session start banner'],
+  ['watch',       'Cross-session watch notifications'],
+  ['autoname',    'Auto-name sessions from their first prompts'],
+];
+const KEYS = new Set(FEATURES.map(f => f[0]));
+// Choices rather than switches. Unset means "never asked". reset leaves them alone,
+// so "never ask again" stays never.
+const SETTINGS = { 'model.haiku': ['ask', 'on', 'off', 'never'] };
+
+const DIR = path.join(os.homedir(), '.puffr');
+const FILE = path.join(DIR, 'config');
+
+const BUILTIN_LAYOUTS = path.join(__dirname, '..', 'layouts');
+const USER_LAYOUTS = path.join(DIR, 'layouts');
+const LAYOUT_NAME = /^[A-Za-z0-9_-]+$/;   // the statusline strips anything else
+
+function readConfig() {
+  const off = new Set(), set = {};
+  let layout = 'compact', txt = '';
+  try { txt = fs.readFileSync(FILE, 'utf8'); } catch { return { off, layout, set }; }
+  for (const line of txt.split('\n')) {
+    const m = /^\s*([a-z.]+)\s*=\s*([A-Za-z0-9_-]+)\s*$/.exec(line);
+    if (!m) continue;
+    if (m[1] === 'layout') layout = m[2];
+    else if (KEYS.has(m[1]) && m[2] === 'off') off.add(m[1]);
+    else if (SETTINGS[m[1]] && SETTINGS[m[1]].includes(m[2]) && m[2] !== 'ask') set[m[1]] = m[2];
+  }
+  return { off, layout, set };
+}
+
+// compact is the default, so it is never written; only real choices are.
+function writeConfig({ off, layout, set }) {
+  fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
+  const body = '# puffr: key=off hides a feature, layout=<name> picks the HUD layout, model.haiku is a choice. Edit freely or use /puffr:settings, /puffr:layout.\n'
+    + (layout && layout !== 'compact' ? `layout=${layout}\n` : '')
+    + FEATURES.filter(([k]) => off.has(k)).map(([k]) => `${k}=off\n`).join('')
+    + Object.entries(set || {}).map(([k, v]) => `${k}=${v}\n`).join('');
+  const tmp = `${FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body, { mode: 0o600, flag: 'wx' });
+  fs.renameSync(tmp, FILE);
+}
+
+const args = process.argv.slice(2).filter(a => a !== '--json');
+const AS_JSON = process.argv.includes('--json');
+const cfg = readConfig();
+const { off, set } = cfg;
+const [cmd, ...rest] = args;
+const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+const C = (c, s) => tty ? `\x1b[${c}m${s}\x1b[0m` : s;
+
+// A user layout with a built-in's name wins, same as in the statusline.
+function layouts() {
+  const found = new Map();
+  for (const [dir, where] of [[BUILTIN_LAYOUTS, 'built-in'], [USER_LAYOUTS, 'yours']]) {
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch {}
+    for (const f of files.sort()) {
+      const m = /^([A-Za-z0-9_-]+)\.ya?ml$/.exec(f);
+      if (m && !(where === 'yours' && found.has(m[1]) && found.get(m[1]).where === 'yours')) found.set(m[1], { file: path.join(dir, f), where });
+    }
+  }
+  return found;
+}
+
+function layoutCmd([sub, a, b]) {
+  const all = layouts();
+  const tilde = p => p.replace(os.homedir(), '~');
+  if (!sub) {
+    console.log('🐡 puffr layouts\n');
+    for (const [name, l] of all) {
+      const on = name === cfg.layout;
+      console.log(`  ${on ? C('32', '●') : ' '} ${name.padEnd(16)} ${C('2', `${l.where.padEnd(9)} ${tilde(l.file)}`)}`);
+    }
+    if (!all.has(cfg.layout)) console.log(C('33', `\n  active layout '${cfg.layout}' has no file; the HUD shows compact.`));
+    if (process.env.PUFFR_LAYOUT) console.log(C('33', `\n  PUFFR_LAYOUT=${process.env.PUFFR_LAYOUT} is set in this environment and overrides the saved choice.`));
+    return;
+  }
+  if (sub === 'new') {
+    const from = b || cfg.layout;
+    if (!a || !LAYOUT_NAME.test(a)) die(`layout names use letters, digits, - and _ only (got: ${a || 'nothing'})`);
+    if (!all.has(from)) die(`no layout named '${from}' to copy from. Known: ${[...all.keys()].join(', ')}`);
+    const dest = path.join(USER_LAYOUTS, `${a}.yaml`);
+    if (fs.existsSync(dest)) die(`${tilde(dest)} already exists; edit it directly`);
+    fs.mkdirSync(USER_LAYOUTS, { recursive: true, mode: 0o700 });
+    const body = fs.readFileSync(all.get(from).file, 'utf8')
+      .replace(/^# [A-Za-z0-9_-]+:.*$/m, `# ${a}: copied from ${from}. Widget list: ${tilde(path.join(BUILTIN_LAYOUTS, 'README.md'))}`);
+    fs.writeFileSync(dest, body, { flag: 'wx', mode: 0o644 });
+    console.log(dest);
+    return;
+  }
+  if (!all.has(sub)) die(`no layout named '${sub}'. Known: ${[...all.keys()].join(', ')}`);
+  cfg.layout = sub;
+  writeConfig(cfg);
+  console.log(`🐡 HUD layout: ${sub}`);
+}
+
+function die(m) { console.error(`puffr-config: ${m}`); process.exit(2); }
+
+if (cmd === 'layout') { layoutCmd(rest); process.exit(0); }
+
+if (cmd === 'set' || cmd === 'get') {
+  const [key, val] = rest;
+  if (!SETTINGS[key]) { console.error(`puffr-config: unknown setting ${key || '(none given)'}. Known: ${Object.keys(SETTINGS).join(', ')}`); process.exit(2); }
+  if (cmd === 'get') { console.log(set[key] || 'ask'); process.exit(0); }
+  if (!SETTINGS[key].includes(val)) { console.error(`puffr-config: ${key} is one of ${SETTINGS[key].join(', ')}`); process.exit(2); }
+  if (val === 'ask') delete set[key]; else set[key] = val;
+  writeConfig(cfg);
+  console.log(`${key}=${val}`);
+  process.exit(0);
+}
+// Should a skill offer Haiku now? on → use it; ask → first time; off → 1 in 10 runs;
+// never → don't. PUFFR_ROLL (0..1) pins the roll for tests.
+if (cmd === 'haiku-check') {
+  const v = set['model.haiku'] || 'ask';
+  const roll = process.env.PUFFR_ROLL != null ? Number(process.env.PUFFR_ROLL) : Math.random();
+  console.log(v === 'on' ? 'on' : v === 'ask' ? 'ask' : v === 'off' && roll < 0.1 ? 'ask' : 'skip');
+  process.exit(0);
+}
+
+if (cmd === 'on' || cmd === 'off') {
+  const keys = rest.includes('all') ? [...KEYS] : rest;
+  const bad = keys.filter(k => !KEYS.has(k));
+  if (!keys.length || bad.length) {
+    console.error(`puffr-config: unknown feature${bad.length > 1 ? 's' : ''} ${bad.join(', ') || '(none given)'}. Known: ${[...KEYS].join(', ')}, all`);
+    process.exit(2);
+  }
+  for (const k of keys) cmd === 'off' ? off.add(k) : off.delete(k);
+  writeConfig(cfg);
+} else if (cmd === 'reset') {
+  off.clear(); cfg.layout = 'compact';
+  writeConfig(cfg);
+} else if (cmd) {
+  console.error('usage: puffr-config [on|off <feature>...|all] [reset] [layout [<name> | new <name> [from]]] [set|get <setting> [value]] [haiku-check] [--json]');
+  process.exit(2);
+}
+
+if (AS_JSON) {
+  console.log(JSON.stringify(Object.fromEntries(FEATURES.map(([k]) => [k, !off.has(k)])), null, 2));
+  process.exit(0);
+}
+console.log('🐡 puffr settings\n');
+console.log(`  ${C('36', 'layout')} ${cfg.layout.padEnd(12)} ${C('2', 'HUD layout (puffr-config layout to list or switch)')}\n`);
+for (const [k, desc] of FEATURES) {
+  const on = !off.has(k);
+  console.log(`  ${on ? C('32', 'on ') : C('2', 'off')}  ${k.padEnd(12)} ${C('2', desc)}`);
+}
+console.log(`\n  ${(set['model.haiku'] || 'ask').padEnd(5)} model.haiku  ${C('2', 'Haiku names and summarizes sessions via your Claude login (ask, on, off, never)')}`);
+if (fs.existsSync(path.join(DIR, 'disabled'))) console.log(C('33', '\n  puffr is muted as a whole (/puffr:off); /puffr:on to resume.'));

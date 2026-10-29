@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+// puffr swarm: how many Claude Code sessions and subagents ran at once, what each lane spent, who messaged
+// whom, and how much of the bill the transcripts explain. Reads transcripts only; no network, no model.
+//
+// Usage: puffr-swarm [--days N | --since WHEN [--until WHEN]]   WHEN: YYYY-MM-DD, "YYYY-MM-DD HH:MM" (local), or 2026-10-21T13:00Z
+//                    [--root [LABEL=]DIR]... [--config FILE] [--exclude <session-id>[,…]] [--min-usd N]
+//                    [--lane NAME=REGEX]... [--rename NAME=REGEX]... [--phase "NAME=FROM..TO"]...
+//                    [--orchestrated-agent REGEX] [--orchestrated-prompt REGEX]
+//                    [--bill USD] [--anon] [--json] [--html [file]] [--verbose]
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const F = require('../lib/puffr.js');
+const S = require('../lib/swarm.js');
+
+const USAGE = `usage: puffr-swarm [--days N | --since WHEN [--until WHEN]] [--root [LABEL=]DIR]... [--config FILE]
+                   [--lane NAME=REGEX]... [--rename NAME=REGEX]... [--phase "NAME=FROM..TO"]...
+                   [--bill USD] [--exclude ID,...] [--min-usd N] [--anon] [--json] [--html [file]]
+  WHEN is YYYY-MM-DD, "YYYY-MM-DD HH:MM" (local time) or 2026-10-21T13:00Z (absolute). Default window: the last 7 days.
+  example: puffr-swarm --since 2026-10-21T13:00Z --until 2026-10-23T21:00Z --root ~/.claude/projects --root laptop=/Volumes/other/.claude/projects
+  config:  --config FILE, else ~/.puffr/swarm.json. JSON keys: roots, lanes, renames, otherLane, phases, orchestrated, bills, exclude, minUsd.`;
+
+const VALUE = ['--since', '--until', '--days', '--root', '--config', '--lane', '--rename', '--phase', '--orchestrated-agent', '--orchestrated-prompt',
+  '--bill', '--min-usd', '--exclude'];
+const BOOL = ['--json', '--anon', '--verbose', '--help', '-h'];
+const die = (m, code = 2) => { console.error(`puffr-swarm: ${m}`); process.exit(code); };
+
+// --- arguments: repeatable value flags, --flag=value, and --html with an optional file ---
+const opt = {}, html = { on: false, file: null };
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  let a = argv[i], val = null;
+  const eq = a.startsWith('--') ? a.indexOf('=') : -1;
+  if (eq > 0) { val = a.slice(eq + 1); a = a.slice(0, eq); }
+  if (a === '--html') { html.on = true; if (val != null) html.file = val; else if (argv[i + 1] && !argv[i + 1].startsWith('--')) html.file = argv[++i]; continue; }
+  if (BOOL.includes(a)) { opt[a] = true; continue; }
+  if (VALUE.includes(a)) {
+    if (val == null) { val = argv[++i]; if (val == null || (val.startsWith('--') && a !== '--lane')) die(`${a} needs a value\n${USAGE}`); }
+    (opt[a] = opt[a] || []).push(val);
+    continue;
+  }
+  die(`unknown option ${a}\n${USAGE}`);
+}
+if (opt['--help'] || opt['-h']) { console.log(USAGE); process.exit(0); }
+const one = n => (opt[n] || []).slice(-1)[0];
+
+function build() {
+  // Config file first, then flags layered on top.
+  const cfgFile = one('--config');
+  let raw = {};
+  if (cfgFile) raw = S.readConfigFile(path.resolve(cfgFile.replace(/^~(?=\/|$)/, F.HOME)));
+  else { const home = path.join(F.DIR, 'swarm.json'); if (fs.existsSync(home)) raw = S.readConfigFile(home); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new S.UsageError('config: expected a JSON object');
+  raw = { ...raw };
+  const pair = (s, what, last) => {
+    const i = last ? s.lastIndexOf('=') : s.indexOf('=');
+    if (i < 1 || i === s.length - 1) throw new S.UsageError(`${what} wants NAME=VALUE, got ${JSON.stringify(s)}`);
+    return [s.slice(0, i), s.slice(i + 1)];
+  };
+  const asList = v => (Array.isArray(v) ? v : []);
+  if (opt['--lane']) raw.lanes = [...opt['--lane'].map(s => { const [name, match] = pair(s, '--lane'); return { name, match }; }), ...asList(raw.lanes)];
+  if (opt['--rename']) raw.renames = [...opt['--rename'].map(s => { const [to, match] = pair(s, '--rename'); return { to, match }; }), ...asList(raw.renames)];
+  if (opt['--phase']) {
+    raw.phases = [...asList(raw.phases), ...opt['--phase'].map(s => {
+      const [name, span] = pair(s, '--phase'), [from, to] = span.split('..');
+      if (!from || !to) throw new S.UsageError(`--phase wants "NAME=FROM..TO", got ${JSON.stringify(s)}`);
+      return { name, from: from.trim(), to: to.trim() };
+    })];
+  }
+  if (opt['--root']) {
+    raw.roots = opt['--root'].map(s => {
+      const m = /^([^=/\\~.][^=/\\]{0,23})=(.+)$/.exec(s);
+      return m ? { label: m[1], path: m[2] } : { path: s };
+    });
+  }
+  if (opt['--exclude']) raw.exclude = [...asList(raw.exclude), ...opt['--exclude'].join(',').split(',').map(x => x.trim()).filter(Boolean)];
+  if (one('--min-usd') != null) raw.minUsd = one('--min-usd');
+  if (one('--orchestrated-agent') != null || one('--orchestrated-prompt') != null) {
+    raw.orchestrated = { ...(raw.orchestrated || {}) };
+    if (one('--orchestrated-agent') != null) raw.orchestrated.agentPattern = one('--orchestrated-agent');
+    if (one('--orchestrated-prompt') != null) raw.orchestrated.promptPattern = one('--orchestrated-prompt');
+  }
+  const cfg = S.normalizeConfig(raw);
+
+  // Window.
+  let untilMs;
+  if (one('--until') != null) untilMs = S.parseWhen(one('--until'), { end: true });
+  else { const d = new Date(); untilMs = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime(); }
+  if (untilMs == null) throw new S.UsageError('--until: use YYYY-MM-DD, "YYYY-MM-DD HH:MM", or 2026-10-21T13:00Z');
+  let sinceMs;
+  if (one('--since') != null) {
+    sinceMs = S.parseWhen(one('--since'));
+    if (sinceMs == null) throw new S.UsageError('--since: use YYYY-MM-DD, "YYYY-MM-DD HH:MM", or 2026-10-21T13:00Z');
+  } else {
+    const n = one('--days') == null ? 7 : parseInt(one('--days'), 10);
+    if (!Number.isFinite(n) || n < 1 || n > 366) throw new S.UsageError('--days wants a number from 1 to 366');
+    const b = new Date(untilMs - 1);
+    sinceMs = new Date(b.getFullYear(), b.getMonth(), b.getDate() - (n - 1)).getTime();
+  }
+  if (sinceMs >= untilMs) throw new S.UsageError('--since must be before --until');
+
+  let bill = null;
+  if (one('--bill') != null) {
+    bill = Number(String(one('--bill')).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(bill) || bill <= 0) throw new S.UsageError('--bill wants a dollar amount, for example --bill 3120.50');
+  }
+  const specs = cfg.roots.length ? cfg.roots : F.roots().map(p => ({ path: p, label: null }));
+  if (!specs.length) throw new S.UsageError(`no transcript folder found; pass --root ${path.join(F.HOME, '.claude', 'projects')}`);
+  return { cfg, roots: S.resolveRoots(specs), W: S.window_(sinceMs, untilMs), bill };
+}
+
+try {
+  const { cfg, roots, W, bill } = build();
+  const t0 = Date.now(), tty = process.stderr.isTTY;
+  const sc = S.scan(cfg, roots, W, { onProgress: (i, n) => { if (tty && n) process.stderr.write(`\r🐡 scanning transcripts ${i}/${n}`); } });
+  if (tty) process.stderr.write('\r\x1b[2K');
+  if (opt['--verbose']) console.error(`puffr-swarm: ${sc.scanned.files} transcripts, ${(sc.scanned.bytes / 1e9).toFixed(2)} GB, ${((Date.now() - t0) / 1000).toFixed(1)} s, roots: ${roots.map(r => r.label).join(', ')}`);
+  const A = S.analyze(sc, cfg, roots, W, { meta: F.loadMeta(), bill, anon: !!opt['--anon'] });
+  // --html writes the file; with --json too, the file is announced on stderr and the JSON goes to stdout.
+  if (html.on) {
+    const name = `puffr-swarm-${S.fmtD(W.sinceMs).replace(' ', 'T').replace(':', '')}_${S.fmtD(W.untilMs).replace(' ', 'T').replace(':', '')}.html`;
+    let file = html.file || name;
+    try { if (fs.statSync(file).isDirectory()) file = path.join(file, name); } catch {}
+    fs.writeFileSync(file, S.renderHtml(A));
+    (opt['--json'] ? console.error : console.log)(`🐡 wrote ${path.resolve(file)}`);
+  }
+  if (opt['--json']) console.log(JSON.stringify(A, null, 2));
+  else if (!html.on) console.log(S.renderText(A, { color: !!process.stdout.isTTY && !process.env.NO_COLOR }));
+} catch (e) {
+  if (e instanceof S.UsageError) die(e.message, 2);
+  die(opt['--verbose'] ? e.stack : e.message, 1);
+}

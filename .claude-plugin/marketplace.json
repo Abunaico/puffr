@@ -1,0 +1,32 @@
+{
+  "name": "puffr-tools",
+  "owner": {
+    "name": "Anthony Shafer"
+  },
+  "metadata": {
+    "description": "PUFFR — context, cost & fleet HUD for Claude Code. HUD statusline, subagent fleet dashboard, and cross-project session radar for Claude Code.",
+    "version": "0.10.0"
+  },
+  "plugins": [
+    {
+      "name": "puffr",
+      "source": "./",
+      "description": "🐡 PUFFR — context, cost & fleet HUD for Claude Code. HUD statusline, subagent fleet dashboard, cross-project session radar for the Warp/Claude Code stack. Inflates as your context fills. Abunai!",
+      "version": "0.10.0",
+      "author": {
+        "name": "Anthony Shafer"
+      },
+      "license": "Free use + attribution (see LICENSE)",
+      "keywords": [
+        "statusline",
+        "sessions",
+        "dashboard",
+        "warp",
+        "tui",
+        "puffr"
+      ],
+      "homepage": "https://github.com/Abunaico/puffr",
+      "repository": "https://github.com/Abunaico/puffr"
+    }
+  ]
+}

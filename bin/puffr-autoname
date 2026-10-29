@@ -1,0 +1,191 @@
+#!/usr/bin/env node
+// puffr autoname — names a session ACCOUNT-CATEGORY-PROJ-TASK-SUB from its first prompts.
+// As a UserPromptSubmit hook it records the first 5 real prompts. After the 3rd and
+// the 5th it starts a background Haiku call (so no prompt ever waits on it), and the
+// next prompt applies the result via hookSpecificOutput.sessionTitle. Vocabulary
+// comes from the user's own past titles in the puffr-sessions cache. A title the user
+// set (/rename, or a resumed named session) always wins: autoname then stands down.
+//
+// Usage: puffr-autoname hook                         (stdin: UserPromptSubmit payload)
+//        puffr-autoname generate <session-id>        (background worker)
+//        puffr-autoname suggest [--cwd <dir>] <prompt>...   print a name, apply nothing
+// Off switch: `autoname=off` in ~/.puffr/config, or /puffr:off.
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn, spawnSync } = require('child_process');
+
+const DIR = path.join(os.homedir(), '.puffr');
+const STATE_DIR = path.join(DIR, 'autoname');
+const CACHE = path.join(DIR, 'sessions-cache.json');
+const GEN_AT = [3, 5];
+const MAX_PROMPTS = 5;
+const MAX_CALLS = 15;           // stop reading the transcript tail after this many prompts
+const ID = /^[A-Za-z0-9-]{8,64}$/;
+
+const clean = s => String(s || '').replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+
+function isOff() {
+  if (fs.existsSync(path.join(DIR, 'disabled'))) return true;
+  try { return /^\s*autoname\s*=\s*off\s*$/m.test(fs.readFileSync(path.join(DIR, 'config'), 'utf8')); }
+  catch { return false; }
+}
+
+function readJSON(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
+function writeJSON(f, v) {
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${f}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(v), { mode: 0o600 });
+  fs.renameSync(tmp, f);
+}
+const statePath = id => path.join(STATE_DIR, `${id}.json`);
+// The worker writes only this file and the hook writes only the state file, so they never race.
+const pendingPath = id => path.join(STATE_DIR, `${id}.pending`);
+
+// Slash commands alone ("/puffr:on") say nothing about the task, so they don't count.
+function isReal(p) { return p.length > 0 && !/^\/[\w:.-]+$/.test(p); }
+
+function lastCustomTitle(file) {
+  if (!file) return null;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size, len = Math.min(size, 1 << 20);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"custom-title"')) continue;
+      try { const e = JSON.parse(lines[i]); if (e.type === 'custom-title') return e.customTitle || null; } catch {}
+    }
+  } catch {} finally { if (fd !== undefined) fs.closeSync(fd); }
+  return null;
+}
+
+function hook() {
+  if (process.env.PUFFR_AUTONAME_CHILD || isOff()) return;
+  let ev; try { ev = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return; }
+  const id = ev && ev.session_id;
+  if (!ID.test(String(id))) return;
+  const st = readJSON(statePath(id)) || { prompts: [], generated: [], applied: null, appliedFrom: 0, calls: 0, done: false };
+  if (st.done) return;
+  st.cwd = ev.cwd || st.cwd;
+  st.calls++;
+
+  const current = lastCustomTitle(ev.transcript_path);
+  const pending = readJSON(pendingPath(id));
+  if (current && current !== st.applied && !(pending && current === pending.title)) {
+    st.done = true; writeJSON(statePath(id), st); return;
+  }
+
+  const p = clean(ev.prompt).trim();
+  if (st.prompts.length < MAX_PROMPTS && isReal(p)) st.prompts.push(p.slice(0, 800));
+
+  let out = null;
+  if (pending && pending.title && pending.title !== st.applied) {
+    out = st.applied = pending.title; st.appliedFrom = pending.from;
+  }
+  const n = st.prompts.length;
+  if (GEN_AT.includes(n) && !st.generated.includes(n)) {
+    st.generated.push(n);
+    spawn(process.execPath, [__filename, 'generate', id], { detached: true, stdio: 'ignore' }).unref();
+  }
+  if (st.appliedFrom >= MAX_PROMPTS || st.calls >= MAX_CALLS) st.done = true;
+  writeJSON(statePath(id), st);
+  if (out) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', sessionTitle: out } }));
+}
+
+function pastTitles(exceptId) {
+  const raw = readJSON(CACHE) || {}, cache = raw.files || raw;   // v2+ caches nest entries under files
+  const seen = new Map(), recent = new Set(), cutoff = Date.now() - 3 * 864e5;
+  for (const [file, ent] of Object.entries(cache)) {
+    const s = ent && ent.state; if (!s || !s.customTitle) continue;
+    if (exceptId && file.endsWith(`${exceptId}.jsonl`)) continue;
+    const t = clean(s.customTitle).trim(), last = Date.parse(s.last) || 0;
+    if (t.length < 3 || t !== t.toUpperCase()) continue;
+    if (last > cutoff) recent.add(t);
+    if (!seen.has(t) || seen.get(t).last < last) seen.set(t, { last, cwd: clean(s.cwd) });
+  }
+  const examples = [...seen].sort((a, b) => b[1].last - a[1].last).slice(0, 60)
+    .map(([t, v]) => `${t} — ${v.cwd || '?'}`);
+  return { examples, recent: [...recent] };
+}
+
+function buildPrompt({ cwd, prompts, current, examples, recent }) {
+  return [
+    'You name Claude Code sessions for one user. Reply with ONLY the name, nothing else.',
+    '',
+    'Format: ACCOUNT-CATEGORY-PROJ-TASK-SUB. Uppercase letters and digits, segments joined by single hyphens.',
+    'Drop any segment that does not apply (2 to 5 segments). Each segment is one word or a tight abbreviation.',
+    '- ACCOUNT: who the work is for, a short code for the client or org folder (an acme folder → ACME). Abunaico folders → ACO.',
+    '  A personal project outside those (e.g. swingr) has no account segment: start with the project name.',
+    '- CATEGORY: the kind of work, e.g. BD, PLAYBOOK, HARNESS, CREATIVE, BIZ, OS, WEB.',
+    '- PROJ: the engagement, client, product or tool.',
+    '- TASK: what this session is doing.',
+    '- SUB: only for a sub-task, or to tell this apart from another session doing the same thing.',
+    "Reuse the user's vocabulary below and match their spelling of accounts, categories and projects.",
+    '',
+    "The user's past session names (name — folder):",
+    ...examples,
+    '',
+    'Names other sessions used in the last 3 days. Never repeat one exactly; add a SUB segment instead:',
+    recent.join(', ') || '(none)',
+    '',
+    `This session's folder: ${cwd || '?'}`,
+    current ? `Current name: ${current}. Keep it unless the prompts show it is wrong; you may add a SUB segment.` : '',
+    '',
+    "The session's first prompts:",
+    ...prompts.map((p, i) => `${i + 1}. ${p.replace(/\s+/g, ' ')}`),
+  ].join('\n');
+}
+
+function normalize(raw) {
+  const line = String(raw || '').split('\n').map(s => s.trim()).filter(Boolean).pop() || '';
+  const segs = line.toUpperCase().replace(/[^A-Z0-9]+/g, '-').split('-').filter(Boolean)
+    .slice(0, 5).map(s => s.slice(0, 16));
+  let t = segs.join('-');
+  while (t.length > 48 && segs.length > 1) { segs.pop(); t = segs.join('-'); }
+  return t;
+}
+
+function dedupe(title, taken) {
+  if (!taken.has(title)) return title;
+  for (let i = 2; ; i++) if (!taken.has(`${title}-${i}`)) return `${title}-${i}`;
+}
+
+function nameFor({ cwd, prompts, current, exceptId }) {
+  const { examples, recent } = pastTitles(exceptId);
+  const bin = process.env.PUFFR_AUTONAME_CLAUDE
+    || (process.env.CLAUDE_CODE_EXECPATH && fs.existsSync(process.env.CLAUDE_CODE_EXECPATH) ? process.env.CLAUDE_CODE_EXECPATH : 'claude');
+  // No settings sources, MCP, tools or skills: no hooks fire in the child, so it can't recurse or slow down.
+  const r = spawnSync(bin, ['-p', '--model', 'haiku', '--no-session-persistence', '--setting-sources', '',
+    '--strict-mcp-config', '--tools', '', '--disable-slash-commands'], {
+    input: buildPrompt({ cwd, prompts, current, examples, recent }),
+    encoding: 'utf8', timeout: 60000, cwd: os.tmpdir(),
+    env: { ...process.env, PUFFR_AUTONAME_CHILD: '1' },
+  });
+  if (r.status !== 0) return null;
+  const t = normalize(r.stdout);
+  if (!t) return null;
+  const taken = new Set(recent); if (current) taken.delete(current);
+  return dedupe(t, taken);
+}
+
+function generate(id) {
+  if (!ID.test(String(id))) return;
+  const st = readJSON(statePath(id)); if (!st || !st.prompts.length) return;
+  const title = nameFor({ cwd: st.cwd, prompts: st.prompts, current: st.applied, exceptId: id });
+  if (title) writeJSON(pendingPath(id), { title, from: st.prompts.length });
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (cmd === 'hook') { try { hook(); } catch {} process.exit(0); }
+else if (cmd === 'generate') { try { generate(rest[0]); } catch {} }
+else if (cmd === 'suggest') {
+  let cwd = process.cwd();
+  if (rest[0] === '--cwd') { cwd = rest[1]; rest.splice(0, 2); }
+  const t = nameFor({ cwd, prompts: rest.map(clean) });
+  if (!t) { console.error('puffr-autoname: no name came back'); process.exit(1); }
+  console.log(t);
+} else { console.error('usage: puffr-autoname hook | generate <id> | suggest [--cwd dir] <prompt>...'); process.exit(2); }

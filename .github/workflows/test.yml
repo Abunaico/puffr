@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install jq (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq (macOS)
+        if: runner.os == 'macOS'
+        run: command -v jq || brew install jq
+      - name: Syntax check
+        run: |
+          for f in statusline.sh subagent-statusline.sh hooks/*.sh; do bash -n "$f"; done
+          for f in bin/*; do node --check "$f"; done
+      - name: Test battery
+        run: bash test/run-tests.sh

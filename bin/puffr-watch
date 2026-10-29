@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+// puffr watch — cross-session activity monitor (Claude Code background monitor).
+// Each stdout line becomes an in-session notification to Claude. Keep them rare
+// and information-dense: busy→idle transitions, errors, and new sessions in
+// OTHER sessions only. Stat-based polling; tail bytes read only on transition.
+//
+// Env: CLAUDE_CODE_SESSION_ID or the older CLAUDE_SESSION_ID (self-exclusion)
+//      PUFFR_WATCH_INTERVAL (seconds, default 15) · PUFFR_WATCH_ONCE=1 (one pass, for tests)
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const ROOT = path.join(os.homedir(), '.claude', 'projects');
+const SELF = process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || '';
+const INTERVAL = (parseInt(process.env.PUFFR_WATCH_INTERVAL, 10) || 15) * 1000;
+const ONCE = process.env.PUFFR_WATCH_ONCE === '1';
+const IDLE_MS = 60e3;      // busy→idle after this much write silence
+const FRESH_MS = 30 * 60e3; // ignore sessions idle longer than this at startup
+const clean = v => String(v || '').replace(/[\x00-\x1f\x7f\u0080-\u009f]/g, '').slice(0, 70);
+
+// sessionId -> { mtime, busy, announcedIdleAt, size }
+const seen = new Map();
+let firstPass = true;
+
+function tailInfo(fp, size) {
+  // Last ~8KB: enough for the final complete line even after tool output.
+  let fd;
+  try { fd = fs.openSync(fp, 'r'); } catch { return {}; }
+  try {
+    const n = Math.min(8192, size);
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, size - n);
+    const lines = buf.toString('utf8').split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let e;
+      try { e = JSON.parse(lines[i]); } catch { continue; }
+      const err = e.isApiErrorMessage === true || e.subtype === 'error' ||
+        (e.type === 'system' && /error/i.test(String(e.content || '')));
+      return { lastType: e.type, err };
+    }
+  } catch {} finally { try { fs.closeSync(fd); } catch {} }
+  return {};
+}
+
+function label(fp, dirName) {
+  // Cheap title: reuse the radar's cache if present, else project dir name.
+  try {
+    const cache = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.puffr', 'sessions-cache.json'), 'utf8'));
+    const rec = (cache.files || {})[fp];
+    const st = rec && (rec.disp || rec.state);
+    if (st) return clean(st.customTitle || st.aiTitle || st.slug || st.summary) || dirName;
+  } catch {}
+  return dirName;
+}
+
+// /puffr:settings switches (`key=off` lines in ~/.puffr/config), re-read every pass.
+function featureOff(key) {
+  let txt;
+  try { txt = fs.readFileSync(path.join(os.homedir(), '.puffr', 'config'), 'utf8'); } catch { return false; }
+  return txt.split('\n').some(l => l.replace(/\s/g, '') === `${key}=off`);
+}
+
+function pass() {
+  // /puffr:off drops this marker; checked every pass so a live watcher goes quiet immediately.
+  if (fs.existsSync(path.join(os.homedir(), '.puffr', 'disabled'))) return;
+  if (featureOff('watch')) return;
+  const now = Date.now();
+  let dirs;
+  try { dirs = fs.readdirSync(ROOT); } catch { return; }
+  for (const d of dirs) {
+    const dir = path.join(ROOT, d);
+    let files;
+    try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+    const proj = d.replace(/^-/, '').split('-').slice(-2).join('/');
+    for (const f of files) {
+      const id = f.replace('.jsonl', '');
+      if (id === SELF) continue;
+      const fp = path.join(dir, f);
+      let st;
+      try { st = fs.statSync(fp); } catch { continue; }
+      if (st.size < 500) continue;
+      const prev = seen.get(id);
+      const age = now - st.mtimeMs;
+
+      if (!prev) {
+        seen.set(id, { mtime: st.mtimeMs, busy: age < IDLE_MS, size: st.size });
+        // Announce genuinely new sessions (appearing after startup), not the backlog.
+        if (!firstPass && age < IDLE_MS) {
+          console.log(`🐡 watch: new session started in ${proj} — ${label(fp, proj)}`);
+        }
+        continue;
+      }
+
+      const grew = st.size > prev.size;
+      if (grew) { prev.busy = true; prev.mtime = st.mtimeMs; prev.size = st.size; prev.announcedIdleAt = 0; continue; }
+
+      if (prev.busy && age >= IDLE_MS && age < FRESH_MS && !prev.announcedIdleAt) {
+        const { lastType, err } = tailInfo(fp, st.size);
+        prev.busy = false; prev.announcedIdleAt = now;
+        const name = label(fp, proj);
+        if (err) {
+          console.log(`🐡 watch: 💥 "${name}" (${proj}) stopped on an ERROR — claude --resume ${id}`);
+        } else if (lastType === 'assistant') {
+          console.log(`🐡 watch: ✅ "${name}" (${proj}) finished its turn and went idle — claude --resume ${id}`);
+        } else {
+          console.log(`🐡 watch: 💤 "${name}" (${proj}) went quiet mid-turn (last entry: ${lastType || '?'}) — may be stuck`);
+        }
+      }
+    }
+  }
+  firstPass = false;
+}
+
+pass();
+if (!ONCE) setInterval(pass, INTERVAL);

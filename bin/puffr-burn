@@ -1,0 +1,866 @@
+#!/usr/bin/env node
+// puffr burn: where the tokens went, which habits cost the most, and whether a
+// change in habits moved the numbers. Reads the radar's index; no network.
+//
+// Usage: puffr-burn [--days N | --since WHEN [--until WHEN]]   WHEN: YYYY-MM-DD or "YYYY-MM-DD HH:MM" (local)
+//                  [--project <substr>] [--account <substr>] [--exclude <session-id>[,…]] [--since-change YYYY-MM-DD]
+//                  [--git | --full] [--json] [--html [file]] [--reindex]
+//        puffr-burn --add-rule "<plain-English customization>" | --rules | --recompile
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const F = require('../lib/puffr.js');
+const RP = require('../lib/report-page.js');
+
+const args = process.argv.slice(2);
+const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 && i + 1 < args.length && !args[i + 1].startsWith('--') ? args[i + 1] : d; };
+const has = n => args.includes(n);
+const die = m => { console.error(`puffr-burn: ${m}`); process.exit(2); };
+const isDay = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const shift = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 86400e3).toISOString().slice(0, 10);
+const span = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 86400e3) + 1;
+
+// A window is a run of local hours [fromH, toH], inclusive, matching the index's hour buckets.
+// A bare day covers the whole day; a clock time is rounded out to whole hours.
+const WHEN = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2})(?::(\d{2}))?)?$/;
+const isWhen = s => WHEN.test(s || '');
+const hourKey = ms => F.hourOf(new Date(ms).toISOString());
+const keyMs = h => new Date(+h.slice(0, 4), +h.slice(5, 7) - 1, +h.slice(8, 10), +h.slice(11, 13)).getTime();
+function win(since, until) {
+  const a = WHEN.exec(since), b = WHEN.exec(until);
+  const start = new Date(+a[1], +a[2] - 1, +a[3], a[4] == null ? 0 : +a[4]).getTime();
+  const end = b[4] == null ? new Date(+b[1], +b[2] - 1, +b[3] + 1).getTime()
+    : new Date(+b[1], +b[2] - 1, +b[3], +b[4], b[5] == null ? 0 : +b[5]).getTime();
+  const fromH = hourKey(start), toH = hourKey(end - 1);
+  const label = (s, m) => m[4] == null ? s : `${m[1]}-${m[2]}-${m[3]} ${m[4].padStart(2, '0')}:${m[5] || '00'}`;
+  return { fromH, toH, from: label(since, a), to: label(until, b), dayOnly: a[4] == null && b[4] == null,
+    hours: Math.round((keyMs(toH) - keyMs(fromH)) / 3600e3) + 1, sinceIso: new Date(start).toISOString(), untilIso: new Date(end).toISOString() };
+}
+
+const today = F.dayOf(new Date().toISOString());
+const CHANGE = flag('--since-change', null);
+if (CHANGE && !isDay(CHANGE)) die('--since-change wants YYYY-MM-DD');
+let until = flag('--until', today), since = flag('--since', null);
+if (!isWhen(until) || (since && !isWhen(since))) die('dates are YYYY-MM-DD or "YYYY-MM-DD HH:MM"');
+if (!since) { const n = parseInt(flag('--days', '30'), 10); since = shift(until.slice(0, 10), -((Number.isFinite(n) && n > 0 ? n : 30) - 1)); }
+if (win(since, until).hours < 1) die('--since must be before --until');
+const PROJ = flag('--project', null);
+const EXCL = (flag('--exclude', '') || '').split(',').map(x => x.trim()).filter(Boolean);
+
+if (has('--add-rule')) {
+  const line = flag('--add-rule', '');
+  if (!line.trim()) die('usage: puffr-burn --add-rule "<plain-English customization>"');
+  F.addReportRule(line);
+  console.log(`🐡 added to ${F.FILES.reportPrompt}: ${F.clean(line).trim()}`);
+}
+
+let all;
+try { all = F.scan({ reindex: has('--reindex') }); } catch (e) { die(e.message); }
+const meta = F.loadMeta();
+const cwds = all.map(s => F.clean(s.state.cwd));
+const tagOf = s => {
+  const renamed = F.clean((meta[s.id] || {}).name || s.state.customTitle);
+  return renamed ? ((/^([A-Za-z][A-Za-z0-9]*)[-_:\s]/.exec(renamed) || [])[1] || renamed).toUpperCase().slice(0, 16) : '(not renamed)';
+};
+// Report customizations: compile the plain-English rules against today's names
+// (as they look without customization), then build the namer with them applied.
+const ACC = F.accounts();
+const baseAcct = org => org === 'codex' ? 'Codex (ChatGPT login)' : F.accountLabel(ACC.byOrg[org] || (org ? { email: `org ${org.slice(0, 8)}`, plan: '?', orgName: '' } : null));
+const custom = (() => {
+  const base = F.projectNamer(cwds, F.loadProjects(false));
+  const uniq = a => [...new Set(a)].sort();
+  const names = {
+    projects: uniq(all.map(s => base(F.clean(s.state.cwd), (meta[s.id] || {}).project))),
+    tags: uniq(all.map(tagOf)),
+    accounts: uniq([...Object.keys(ACC.byOrg).map(baseAcct), baseAcct('codex'), baseAcct('')]),
+  };
+  return F.compileReportRules(names, { force: has('--recompile') });
+})();
+const RULES = custom.rules || {};
+const hidden = new Set((RULES.hide_projects || []).map(n => n.toLowerCase()));
+const pmap = F.loadProjects();
+const nameProject = F.projectNamer(cwds, pmap);
+const projOf = s => nameProject(F.clean(s.state.cwd), (meta[s.id] || {}).project);
+if (has('--rules')) {
+  console.log(`🐡 report customizations: ${F.FILES.reportPrompt}\n`);
+  console.log(F.reportPromptText() || '  (empty: add one with puffr-burn --add-rule "...")');
+  console.log(`\n  status: ${custom.status}${custom.usd ? ` · Haiku $${custom.usd.toFixed(4)}` : ''}`);
+  console.log(JSON.stringify(RULES, null, 2).split('\n').map(l => `  ${l}`).join('\n'));
+  process.exit(0);
+}
+// Account per request comes from Claude Code's credential_org record. Subagents and
+// older transcripts without it fall back to the parent's account, then to a profile's
+// last-session record, else unknown.
+const orgFor = (org, s) => org || s.state.org || ACC.bySession[s.id] || '';
+const acctName = org => { const n = baseAcct(org); return (RULES.account_labels || {})[n] || n; };
+const mainAcct = new Map();
+function sessionAccount(s) {
+  if (mainAcct.has(s.id)) return mainAcct.get(s.id);
+  const by = {};
+  F.eachDay(s, (d, b) => { for (const [o, mm] of Object.entries(b.o || {})) for (const [m, u] of Object.entries(mm)) by[orgFor(o, s)] = (by[orgFor(o, s)] || 0) + F.costOf(m, u); });
+  const best = Object.entries(by).sort((a, b) => b[1] - a[1])[0];
+  const name = acctName(best ? best[0] : orgFor('', s));
+  mainAcct.set(s.id, name);
+  return name;
+}
+const ACCT = flag('--account', null);
+const sessions = all.filter(s => !EXCL.some(x => s.id.startsWith(x)) && !hidden.has(projOf(s).toLowerCase()) && (!PROJ || projOf(s).toLowerCase().includes(PROJ.toLowerCase()))
+  && (!ACCT || ACCT.toLowerCase().split(/\s+/).filter(Boolean).every(w => sessionAccount(s).toLowerCase().includes(w))));
+const fam = m => (/fable|mythos/.test(m) ? 'fable' : /opus/.test(m) ? 'opus' : /sonnet/.test(m) ? 'sonnet' : /haiku/.test(m) ? 'haiku' : 'other');
+
+// The hour-by-hour timeline is kept for windows up to two weeks.
+const TIMELINE_HOURS = 14 * 24;
+const sessLabel = s => { const mm = meta[s.id] || {}; return F.clean(mm.name || s.state.customTitle) || F.clean(s.title || mm.label || s.state.aiTitle || s.state.summary).slice(0, 60) || s.id.slice(0, 8); };
+function aggregate(W) {
+  const fH = W.fromH, tH = W.toH, fD = fH.slice(0, 10), tD = tH.slice(0, 10), prSeen = new Set();
+  const A = { from: W.from, to: W.to, hours: W.hours, dayOnly: W.dayOnly, sinceIso: W.sinceIso, untilIso: W.untilIso,
+    days: W.hours / 24, hourly: W.hours <= TIMELINE_HOURS ? {} : null, usd: 0, reqs: 0, tokens: [0, 0, 0, 0, 0], sessions: 0,
+    projects: {}, models: {}, exec: {}, comp: [0, 0, 0, 0, 0], brk: {}, edits: 0, commits: 0, prs: 0,
+    memUsd: 0, reads: {}, unpriced: new Set(),
+    drv: { read: 0, write: 0, out: 0, input: 0 }, accounts: {}, agents: {}, work: {}, compactCallUsd: 0,
+    list: [], tags: {}, tools: {}, execBig: { usd: 0, asSonnet: 0 }, subBig: { usd: 0, asSonnet: 0 }, repos: {}, mainUsd: 0, subUsd: 0, prompts: 0, prefixUsd: 0, prefixTok: 0, mainReqs: 0 };
+  for (const s of sessions) {
+    const name = projOf(s);
+    let touched = false, sUsd = 0, sReqs = 0;
+    const sDays = new Set(), sMd = {}, sWk = {}, sAg = {};
+    const add = (o, key, v) => { o[key] = (o[key] || 0) + v; };
+    const P = () => A.projects[name] || (A.projects[name] = { usd: 0, sessions: 0, opusExec: 0, exec: 0, restoreUsd: 0, memTok: 0 });
+    const memTok = Object.values(s.state.mem || {}).reduce((a, b) => a + b, 0);
+    const lab = sessLabel(s);
+    F.eachDay(s, (d, b, isMain, agent) => {
+      if (d < fH || d > tH) return;
+      touched = true; sDays.add(d.slice(0, 10));
+      if (!A.firstH || d < A.firstH) A.firstH = d;
+      if (A.hourly) {
+        const Hr = A.hourly[d] || (A.hourly[d] = { usd: 0, reqs: 0, prompts: 0, by: {} });
+        for (const [m, u] of Object.entries(b.u)) { const c = F.costOf(m, u); Hr.usd += c; Hr.reqs += u[5]; Hr.by[lab] = (Hr.by[lab] || 0) + c; }
+        if (isMain) Hr.prompts += b.prompts || 0;
+      }
+      for (const [c, mm] of Object.entries(b.k || {})) for (const [m, u] of Object.entries(mm)) add(sWk, c, F.costOf(m, u));
+      for (const [m, u] of Object.entries(b.u)) {
+        const c = F.costOf(m, u), big = /opus|fable|mythos/.test(m);
+        sUsd += c; sReqs += u[5]; add(sMd, m, c); add(sAg, isMain ? '' : agent, c);
+        if (big && !isMain) { A.subBig.usd += c; A.subBig.asSonnet += F.costOf('claude-sonnet-5', u); }
+      }
+      for (const cat of ['code', 'docs', 'shell']) for (const [m, u] of Object.entries((b.k || {})[cat] || {})) {
+        if (isMain && /opus|fable|mythos/.test(m)) { A.execBig.usd += F.costOf(m, u); A.execBig.asSonnet += F.costOf('claude-sonnet-5', u); }
+      }
+      const G = A.agents[isMain ? '' : agent] || (A.agents[isMain ? '' : agent] = { usd: 0, reqs: 0, runs: 0, tok: 0 });
+      for (const [m, u] of Object.entries(b.u)) { G.usd += F.costOf(m, u); G.reqs += u[5]; G.tok += u[0] + u[1] + u[2] + u[3] + u[4]; }
+      for (const [c, mm] of Object.entries(b.k || {})) {
+        const W = A.work[c] || (A.work[c] = { usd: 0, reqs: 0 });
+        for (const [m, u] of Object.entries(mm)) { W.usd += F.costOf(m, u); W.reqs += u[5]; }
+      }
+      for (const [m, z] of Object.entries(b.cz || {})) { const p = F.price(m); if (p) A.compactCallUsd += (z[0] * p.r + z[1] * p.o) / 1e6; }
+      for (const [m, u] of Object.entries(b.u)) {
+        const usd = F.costOf(m, u);
+        if (!F.price(m)) A.unpriced.add(m);
+        A.usd += usd; P().usd += usd; A.reqs += u[5];
+        for (let i = 0; i < 5; i++) A.tokens[i] += u[i];
+        const M = A.models[m] || (A.models[m] = { usd: 0, u: [0, 0, 0, 0, 0, 0] });
+        M.usd += usd; for (let i = 0; i < 6; i++) M.u[i] += u[i];
+        const p = F.price(m);
+        if (p) {
+          A.drv.read += u[1] * p.r / 1e6; A.drv.write += (u[2] * 1.25 + u[3] * 2) * p.i / 1e6;
+          A.drv.out += u[4] * p.o / 1e6; A.drv.input += u[0] * p.i / 1e6;
+        }
+        if (isMain) {
+          A.mainUsd += usd; A.mainReqs += u[5];
+          if (p && memTok) A.memUsd += memTok * u[5] * p.r / 1e6;
+          if (p && s.state.base) { A.prefixUsd += s.state.base * u[5] * p.r / 1e6; A.prefixTok += s.state.base * u[5]; }
+        } else A.subUsd += usd;
+      }
+      for (const [o, mm] of Object.entries(b.o || {})) {
+        const name = acctName(orgFor(o, s)), X = A.accounts[name] || (A.accounts[name] = { usd: 0, reqs: 0, ids: new Set() });
+        for (const [m, u] of Object.entries(mm)) { X.usd += F.costOf(m, u); X.reqs += u[5]; }
+        X.ids.add(s.id);
+      }
+      for (const [m, n] of Object.entries(b.exec)) {
+        A.exec[fam(m)] = (A.exec[fam(m)] || 0) + n; P().exec += n;
+        if (/opus|fable|mythos/.test(m)) P().opusExec += n;
+      }
+      for (let i = 0; i < 5; i++) A.comp[i] += b.comp[i];
+      for (const [r, x] of Object.entries(b.brk)) {
+        const B = A.brk[r] || (A.brk[r] = { n: 0, usd: 0, full: 0 });
+        B.n += x.n;
+        for (const [m, w] of Object.entries(x.t)) {
+          const c = F.rewriteCost(m, w[0], w[1]), p = F.price(m);
+          B.usd += c; if (p) B.full += (w[0] * 1.25 + w[1] * 2) * p.i / 1e6;
+          if (r === 'idle') P().restoreUsd += c;
+        }
+      }
+      A.edits += b.edits; A.commits += b.commits;
+      if (isMain) A.prompts += b.prompts || 0;
+    });
+    // A PR linked from several sessions counts once.
+    for (const [url, d] of Object.entries(s.state.prs || {})) if (d && d >= fD && d <= tD && !prSeen.has(url)) { prSeen.add(url); A.prs++; }
+    s.subs.forEach((st, i) => {
+      if (Object.keys(st.days || {}).some(d => d >= fH && d <= tH)) {
+        const G = A.agents[(s.subAgents || [])[i] || 'unknown'];
+        if (G) G.runs++;
+      }
+    });
+    if (!touched) continue;
+    A.sessions++; P().sessions++; P().memTok = Math.max(P().memTok, memTok);
+    const H = A.tools[s.harness] || (A.tools[s.harness] = { usd: 0, sessions: 0, reqs: 0, tokens: [0, 0, 0, 0, 0], unpriced: 0 });
+    H.sessions++;
+    F.eachDay(s, (d, b) => { if (d < fH || d > tH) return; for (const [m, u] of Object.entries(b.u)) {
+      H.usd += F.costOf(m, u); H.reqs += u[5]; for (let i = 0; i < 5; i++) H.tokens[i] += u[i];
+      if (!F.price(m)) H.unpriced += u[0] + u[1] + u[2] + u[3] + u[4];
+    } });
+    // /rename titles are the user's own labels; their leading token (ACME-, ACO-) is a workstream tag.
+    const mm = meta[s.id] || {}, renamed = F.clean(mm.name || s.state.customTitle);
+    const tag0 = tagOf(s), tag = (RULES.tag_aliases || {})[tag0] || tag0;
+    A.list.push({ id: s.id, title: lab, renamed: !!renamed, tag,
+      project: name, account: sessionAccount(s), harness: s.harness, usd: sUsd, reqs: sReqs, days: sDays.size, md: sMd, wk: sWk, ag: sAg,
+      first: [...sDays].sort()[0], last: [...sDays].sort().pop() });
+    const TG = A.tags[tag] || (A.tags[tag] = { usd: 0, sessions: 0 }); TG.usd += sUsd; TG.sessions++;
+    for (const dir of [F.clean(s.state.cwd), ...Object.keys(s.state.editDirs || {})]) {
+      const root = dir && F.gitRoot(dir);
+      if (root && !A.repos[root]) A.repos[root] = name;
+    }
+    for (const [p, n] of Object.entries(s.state.reads || {})) {
+      const R = A.reads[p] || (A.reads[p] = { n: 0, sessions: 0 });
+      R.n += n; R.sessions++;
+    }
+  }
+  A.unpriced = [...A.unpriced];
+  // Rates and monthly savings count from the first active day, so a wide --since
+  // doesn't dilute them across months with no sessions.
+  if (A.firstH && A.firstH > fH) A.days = W.dayOnly ? span(A.firstH.slice(0, 10), tD) : (keyMs(tH) - keyMs(A.firstH)) / 86400e3 + 1 / 24;
+  if (A.hourly) for (let t = keyMs(fH); t <= keyMs(tH); t += 3600e3) { const h = hourKey(t); A.hourly[h] = A.hourly[h] || { usd: 0, reqs: 0, prompts: 0, by: {} }; }
+  for (const X of Object.values(A.accounts)) { X.sessions = X.ids.size; delete X.ids; }
+  return A;
+}
+
+function autocompact() {
+  if (process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) return process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE;
+  for (const d of [process.env.CLAUDE_CONFIG_DIR, path.join(F.HOME, '.claude')].filter(Boolean)) {
+    const v = ((F.readJson(path.join(d, 'settings.json'), {}) || {}).env || {}).CLAUDE_AUTOCOMPACT_PCT_OVERRIDE;
+    if (v) return String(v);
+  }
+  return null;
+}
+
+// Name only the big model families that actually ran ("Opus", "Fable", or both).
+function bigNames(A) {
+  const has = re => Object.keys(A.models).some(m => re.test(m));
+  const n = [has(/opus/) && 'Opus', has(/fable|mythos/) && 'Fable'].filter(Boolean);
+  return n.length ? n.join(' and ') : 'Opus or Fable';
+}
+// Monthly figures scale the period to 30 days; under a week that is a guess about a typical month.
+const shortNote = A => A.days < 7 ? ` This period is ${A.days < 1.5 ? `${Math.round(A.days * 24)} hours` : `${A.days.toFixed(1)} days`} long, so monthly figures assume it was a typical stretch; for an event or sprint, read the period totals instead.` : '';
+
+// --- practices: one line per tip from the team's thread, each with its own number ---
+function practices(A) {
+  const out = [];
+  const execAll = Object.values(A.exec).reduce((a, b) => a + b, 0);
+  const big = (A.exec.opus || 0) + (A.exec.fable || 0);
+  if (execAll) out.push({ key: 'model', warn: big / execAll >= 0.5, title: 'Big models doing execution',
+    value: `${pct(big / execAll)} of Edit/Write/Bash calls ran on ${bigNames(A)}`, tip: 'Opus-High to plan and review, Sonnet-High to execute (infra excepted). Don\'t ask Claude which model to use: it picks the biggest.' });
+  const manual = A.comp[1] + A.comp[2];
+  out.push({ key: 'compact', warn: A.comp[3] > A.comp[4], title: 'Compacting mid-work',
+    value: `${manual} manual compaction${manual === 1 ? '' : 's'}: ${A.comp[3]} followed by more work within 15m, ${A.comp[4]} before a break · ${A.comp[0]} auto`,
+    tip: 'Only compact when walking away. Each compaction rewrites the context at the cache-write price.' });
+  if (A.comp[1]) out.push({ key: 'early', warn: true, title: 'Compacting early',
+    value: `${A.comp[1]} manual compaction${A.comp[1] === 1 ? '' : 's'} under 200k tokens`, tip: 'On 1M-context models there is no need to stay under 150k. Let the window work.' });
+  const idle = A.brk.idle || { n: 0, usd: 0 };
+  out.push({ key: 'cache', warn: idle.usd > A.usd * 0.05, title: 'Cache restores after idle',
+    value: `${idle.n} return${idle.n === 1 ? '' : 's'} after the cache expired · ${usd(idle.usd)} (${pct(A.usd ? idle.usd / A.usd : 0)} of spend)`,
+    tip: 'Coming back after the cache TTL rewrites the whole context. Compact before a long break so the rewrite is small.' });
+  const topMem = Object.entries(A.projects).sort((a, b) => b[1].memTok - a[1].memTok)[0];
+  if (topMem && topMem[1].memTok) out.push({ key: 'claudemd', warn: topMem[1].memTok > 10000, title: 'CLAUDE.md load',
+    value: `≈${k(topMem[1].memTok)} tokens of CLAUDE.md and memory on every request in ${topMem[0]} · ≈${usd(A.memUsd)} across all projects`,
+    tip: 'CLAUDE.md should be a treasure map, not a laundry list of do\'s and don\'ts.' });
+  const rereads = Object.entries(A.reads).filter(([, r]) => r.sessions >= 3).sort((a, b) => b[1].sessions - a[1].sessions || b[1].n - a[1].n).slice(0, 3);
+  if (rereads.length) out.push({ key: 'reads', warn: rereads.some(([p]) => /\.md$/i.test(p) && !/CLAUDE\.md$/.test(p)), title: 'Files re-read across sessions',
+    value: rereads.map(([p, r]) => `${path.basename(p)} ${r.n}× in ${r.sessions} sessions`).join(' · '),
+    tip: 'A file read in every session belongs in CLAUDE.md as a one-line pointer. A stale copy, like an imported backlog, should leave the repo: it competes with GitHub as the source of truth.' });
+  const D = drivers(A);
+  if (D.prefixTok) out.push({ key: 'overhead', warn: D.prefixTok > 40000, title: 'Fixed prompt overhead',
+    value: `≈${k(D.prefixTok)} tokens ride on every request before you type · ≈${usd(A.prefixUsd)}`,
+    tip: 'Plugins, MCP servers, skill and agent listings all load into every request. Disable the ones a project doesn\'t use.' });
+  const ac = autocompact();
+  out.push({ key: 'autocompact', warn: !ac, title: 'Auto-compact threshold',
+    value: ac ? `${ac}%` : 'default (not set)', tip: 'Set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 so compaction happens before the agent panics near the limit.' });
+  return out;
+}
+
+// --- cost drivers: what each dollar paid for ---
+const WHY = { idle: 'returns after the cache expired', start: 'session starts', compact: 'compactions', model: 'model switches', prefix: 'prefix changes (tools, MCP, prompt)' };
+function drivers(A) {
+  const brkFull = Object.values(A.brk).reduce((a, b) => a + b.full, 0);
+  const writes = [['growth (new context each turn)', Math.max(0, A.drv.write - brkFull)]]
+    .concat(Object.entries(A.brk).map(([r, b]) => [`${WHY[r] || r} (${b.n})`, b.full])).sort((a, b) => b[1] - a[1]);
+  const ctx = A.tokens[0] + A.tokens[1] + A.tokens[2] + A.tokens[3];
+  return {
+    parts: [['Cache reads (context re-read every request)', A.drv.read], ['Cache writes', A.drv.write], ['Output (including thinking)', A.drv.out], ['Uncached input', A.drv.input]],
+    writes, avgCtx: A.reqs ? ctx / A.reqs : 0,
+    prefixTok: A.mainReqs ? A.prefixTok / A.mainReqs : 0, perPrompt: A.prompts ? A.mainReqs / A.prompts : 0,
+  };
+}
+
+// --- who spent it, and on what kind of work ---
+const WORK = { code: 'Editing code', docs: 'Editing docs (.md, .txt)', shell: 'Shell commands', explore: 'Reading and searching',
+  delegate: 'Delegating to agents', tools: 'Other tools (MCP, skills)', talk: 'Conversation (no tools)', compact: 'Rewriting after compaction' };
+function agentRows(A) {
+  const rows = Object.entries(A.agents).map(([n, g]) => ({ name: n || 'Your turns (main thread)', main: !n, ucef: /^ucef-/.test(n), ...g }));
+  const sum = f => rows.filter(f).reduce((a, r) => ({ usd: a.usd + r.usd, runs: a.runs + r.runs }), { usd: 0, runs: 0 });
+  return { main: rows.find(r => r.main) || { usd: 0, reqs: 0 }, ucef: sum(r => r.ucef), other: sum(r => !r.main && !r.ucef),
+    list: rows.filter(r => !r.main).sort((a, b) => b.usd - a.usd) };
+}
+
+// --- before/after: per-day and per-unit rates, so unequal periods compare fairly ---
+function rates(A) {
+  const execAll = Object.values(A.exec).reduce((a, b) => a + b, 0);
+  return [
+    ['Spend per day', A.usd / A.days, usd, -1],
+    ['Spend per session', A.sessions ? A.usd / A.sessions : 0, usd, -1],
+    ['Opus/Fable share of execution', execAll ? ((A.exec.opus || 0) + (A.exec.fable || 0)) / execAll : 0, pct, -1],
+    ['Manual compactions per day', (A.comp[1] + A.comp[2]) / A.days, x => x.toFixed(1), -1],
+    ['Mid-work compactions per day', A.comp[3] / A.days, x => x.toFixed(1), -1],
+    ['Cache-restore spend per day', (A.brk.idle || { usd: 0 }).usd / A.days, usd, -1],
+    ['CLAUDE.md spend per day', A.memUsd / A.days, usd, -1],
+    ['Spend per commit', A.commits ? A.usd / A.commits : null, usd, -1],
+    ['Spend per PR', A.prs ? A.usd / A.prs : null, usd, -1],
+    ['Commits per day', A.commits / A.days, x => x.toFixed(1), 1],
+  ];
+}
+
+const nRules = Object.values(RULES).reduce((a, v) => a + (Array.isArray(v) ? v.length : Object.keys(v).length), 0);
+const CUSTOM_NOTE = custom.status === 'empty' ? ''
+  : custom.status === 'haiku-off' ? `customizations in ${F.FILES.reportPrompt} need Haiku: puffr-config set model.haiku on`
+  : custom.status === 'failed' ? `couldn't compile ${F.FILES.reportPrompt}; using the last good version (${nRules} edits)`
+  : `customized: ${nRules} edit${nRules === 1 ? '' : 's'} from ${F.FILES.reportPrompt}${custom.status === 'compiled' ? ` (compiled now by Haiku${custom.usd ? `, $${custom.usd.toFixed(4)}` : ''})` : ''}`;
+const k = n => n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(Math.round(n));
+const usd = v => v == null ? '–' : v >= 1000 ? `$${Math.round(v).toLocaleString('en-US')}` : v >= 100 ? `$${Math.round(v)}` : `$${v.toFixed(2)}`;
+const pct = x => `${Math.round(x * 100)}%`;
+
+// --- git: commits and lines changed per project in the period (full report only) ---
+const GIT = has('--git') || has('--full') || has('--html');
+function gitStats(A) {
+  const { spawnSync } = require('child_process'), out = {};
+  // Worktrees and clones of one repo share history: count each commit once, by hash.
+  const seen = new Set();
+  for (const [root, name] of Object.entries(A.repos).slice(0, 60)) {
+    // Bounded per repo: a hung network mount must not stall the report.
+    const r = spawnSync('git', ['-C', root, 'log', `--since=${A.sinceIso}`, `--until=${A.untilIso}`, '--no-merges', '--shortstat', '--pretty=tformat:@@%H'],
+      { encoding: 'utf8', timeout: 4000, maxBuffer: 32 << 20 });
+    if (r.status !== 0 || !r.stdout) continue;
+    const G = out[name] || (out[name] = { repos: 0, commits: 0, files: 0, ins: 0, del: 0 });
+    G.repos++;
+    for (const c of r.stdout.split(/^@@/m).slice(1)) {
+      const hash = c.slice(0, 40);
+      if (seen.has(hash)) continue;
+      seen.add(hash); G.commits++;
+      const m = /(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/.exec(c);
+      if (m) { G.files += +m[1]; G.ins += +(m[2] || 0); G.del += +(m[3] || 0); }
+    }
+  }
+  for (const [n, G] of Object.entries(out)) if (!G.commits) delete out[n];
+  return out;
+}
+
+// --- insights: ranked levers with a monthly saving computed from this data ---
+function insights(A) {
+  const f = 30 / A.days, out = [];
+  const add = (title, save, detail, action) => { if (save * f >= 1) out.push({ title, save: save * f, period: save, detail: `${detail} In this period: ${usd(save)}.`, action }); };
+  add('Run execution on Sonnet', A.execBig.usd - A.execBig.asSonnet,
+    `${usd(A.execBig.usd)} of your own edit and shell turns ran on ${bigNames(A)}; the same tokens on Sonnet 5 cost ${usd(A.execBig.asSonnet)}.`,
+    'Plan and review on Opus, then /model sonnet to implement (infra excepted). Switch at a task boundary: a mid-session switch rewrites the cache once.');
+  add('Put subagents on Sonnet', A.subBig.usd - A.subBig.asSonnet,
+    `${usd(A.subBig.usd)} of subagent work ran on ${bigNames(A)} (general-purpose agents and forks inherit your model); on Sonnet 5, ${usd(A.subBig.asSonnet)}.`,
+    'Give agent definitions `model: sonnet`, and delegate to typed agents instead of general-purpose where you can.');
+  const cz = Object.values(A.models).length && A.comp[0] + A.comp[1] + A.comp[2];
+  const idle = A.brk.idle || { usd: 0, n: 0 };
+  add('Compact before you walk away', idle.usd * 0.8,
+    `${idle.n} returns after the cache expired rewrote the whole context: ${usd(idle.usd)} above the cache-read price.${cz ? '' : ''}`,
+    'Before a break longer than the cache TTL, /compact: the rewrite on return is the summary, not the full context (about 80% smaller).');
+  const D = drivers(A);
+  if (D.prefixTok > 30000) add('Trim the fixed prompt overhead', A.prefixUsd * (1 - 30000 / D.prefixTok),
+    `≈${k(D.prefixTok)} tokens of system prompt, tools, skills, and CLAUDE.md ride on every request (${usd(A.prefixUsd)}).`,
+    'Disable plugins and MCP servers a project doesn\'t use (project settings), and keep CLAUDE.md a short map. Target: under 30k.');
+  if (D.avgCtx > 200000) add('Keep sessions shorter', A.drv.read * (1 - 150000 / D.avgCtx),
+    `The average request re-reads ${k(D.avgCtx)} tokens of context; cache reads are ${pct(A.usd ? A.drv.read / A.usd : 0)} of spend.`,
+    'Start a fresh session per task and hand off with a short summary instead of carrying a long history. Saving shown is for a 150k average.');
+  const sw = A.brk.model || { usd: 0, n: 0 };
+  add('Pick the model at session start', sw.usd, `${sw.n} mid-session model switches each rewrote the cache.`, 'Choose the model before the first prompt, or start a new session to change it.');
+  const cp = A.brk.compact || { usd: 0, n: 0 };
+  add('Fewer mid-work compactions', cp.usd + A.compactCallUsd, `${cp.n} compactions rewrote the cache, plus ≈${usd(A.compactCallUsd)} in summary calls.`, 'Let the 1M window work; compact only before a break.');
+  return out.sort((a, b) => b.save - a.save);
+}
+
+// --- what puffr itself costs ---
+function puffrCost(A) {
+  const haiku = (F.readJson(F.FILES.spend, {}) || {}).haiku || { usd: 0, calls: 0 };
+  // Skill descriptions are listed in every request's context; the banner line once per session.
+  let chars = 160;
+  let dirs = [];
+  try { dirs = fs.readdirSync(path.join(F.PUFFR_ROOT, 'skills')); } catch {}
+  for (const d of dirs) {
+    let t = '';
+    try { t = fs.readFileSync(path.join(F.PUFFR_ROOT, 'skills', d, 'SKILL.md'), 'utf8'); } catch { continue; }
+    chars += `- puffr:${d}: ${(/^description:\s*(.*)$/m.exec(t) || [])[1] || ''}`.length;
+  }
+  const skillTok = Math.ceil(chars / 4), perTok = A.tokens[1] ? A.drv.read / A.tokens[1] : 0;
+  return { haiku, skillTok, skillsUsd: skillTok * A.mainReqs * perTok };
+}
+
+const per = (v, n) => n ? v / n : null;
+
+// --- timeline: spend per hour, with the sessions (lanes) that spent it ---
+function hourRows(A) {
+  if (!A.hourly) return [];
+  return Object.keys(A.hourly).sort().map(h => {
+    const x = A.hourly[h], d = new Date(keyMs(h));
+    return { h, label: `${d.toLocaleDateString('en-US', { weekday: 'short' })} ${h.slice(5, 10)} ${h.slice(11, 13)}:00`, usd: x.usd, reqs: x.reqs, prompts: x.prompts,
+      top: Object.entries(x.by).sort((a, b) => b[1] - a[1]).filter(([, v]) => v >= 0.005) };
+  });
+}
+const windowNote = A => `${A.dayOnly ? '' : ` (${A.hours} h)`}${EXCL.length ? ` · excluding ${EXCL.map(x => x.slice(0, 8)).join(', ')}` : ''}`;
+
+// --- UCEF "tokens saved": Vanity metric, not a measured fact. An explicitly-labeled estimate for UCEF
+// orchestration quality, not a measured fact. Two deliberately separate, documented parts:
+//
+// 1. Detection (what puffr can actually see): Claude Code transcripts never carry a
+//    specialist's Phase 4.1 completion-verification score or Phase 4.2 constitutional-ai
+//    score inline, and the richer UCEF telemetry those numbers live in (orchestration-
+//    audit.jsonl, field_stability_events under a project's own .claude/data/workspaces/.../
+//    sessions/... tree) is per-project state puffr's transcript scanner does not read. So
+//    there is no honest way to gate this estimate on the actual ">92% completion, >0.97
+//    constitutional" compliance bar per session. Scoped down to what IS visible in every
+//    transcript puffr already indexes: a request counts as "UCEF-run" when the subagent that
+//    answered it has a recorded agentType starting with "ucef-" (ucef-core:*, ucef-business:*,
+//    and so on). That is UCEF orchestration presence, not confirmed quality-gate passage.
+// 2. Baseline (modeled, not measured): UCEF_BASELINE_REWORK_FACTOR is a stated assumption,
+//    not an instrumented comparison. It is Abunai Co.'s estimate of how many more turns, and
+//    their tokens, an equivalent-quality deliverable costs without multi-phase decomposition
+//    and verification, from the rework and re-prompts those gates are meant to catch inline
+//    before they reach you.
+const UCEF_BASELINE_REWORK_FACTOR = 0.35;
+const UCEF_METHODOLOGY = 'Detection: a request counts as "UCEF-run" when a '
+  + 'ucef-core:*/ucef-*:* subagent answered it, meaning orchestration ran. puffr cannot read per-session '
+  + 'completion-verification or constitutional-ai compliance scores from a transcript, so this does not confirm '
+  + 'the ">92% completion, >0.97 constitutional" quality gates actually passed on that turn, only that UCEF '
+  + "orchestration was present. Baseline: modeled, not measured. Abunai Co. assumes an equivalent-quality "
+  + 'deliverable without UCEF\'s multi-phase verification costs about 35% more turns (rework, re-prompts) than '
+  + 'the gates catch inline. Estimated tokens and dollars saved = UCEF-run tokens times that assumed rate.';
+
+function ucefSavings(A) {
+  const rows = Object.entries(A.agents).filter(([n]) => /^ucef-/.test(n));
+  const reqs = rows.reduce((a, [, g]) => a + g.reqs, 0);
+  if (!reqs) return null;
+  const tok = rows.reduce((a, [, g]) => a + (g.tok || 0), 0);
+  const spend = rows.reduce((a, [, g]) => a + g.usd, 0);
+  const savedUsd = spend * UCEF_BASELINE_REWORK_FACTOR;
+  const vanillaTurns = Math.round(reqs * (1 + UCEF_BASELINE_REWORK_FACTOR));
+  return {
+    reqs, tok, usd: spend,
+    savedTok: Math.round(tok * UCEF_BASELINE_REWORK_FACTOR),
+    savedUsd,
+    vanillaTurns,
+    extraTurns: vanillaTurns - reqs,
+    vanillaUsd: spend * (1 + UCEF_BASELINE_REWORK_FACTOR),
+    monthlyUsd: savedUsd * (30 / Math.max(1, A.days)),
+  };
+}
+
+function full(A) { return { A, practices: practices(A), insights: insights(A), puffr: puffrCost(A), ucef: ucefSavings(A), git: GIT ? gitStats(A) : null }; }
+let report;
+if (CHANGE) {
+  const len = Math.max(7, span(CHANGE, until.slice(0, 10)));
+  const before = aggregate(win(shift(CHANGE, -len), shift(CHANGE, -1))), after = aggregate(win(CHANGE, until));
+  report = { mode: 'compare', change: CHANGE, after: full(after), before: full(before),
+    rows: rates(before).map((r, i) => ({ label: r[0], before: r[1], after: rates(after)[i][1], fmt: r[2], better: r[3] })) };
+} else report = { mode: 'period', ...full(aggregate(win(since, until))) };
+
+if (has('--json')) {
+  console.log(JSON.stringify(report, (key, v) => (typeof v === 'function' ? undefined : v), 2));
+} else if (has('--html')) {
+  // The name says whose spend and when: one account's slug, or all-accounts.
+  const slug = v => v.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const span_ = (report.mode === 'compare' ? [report.before.A.from, report.after.A.to] : [report.A.from, report.A.to]).map(x => x.replace(' ', 'T').replace(':', ''));
+  const name = ['puffr-burn', ACCT ? slug(ACCT) : 'all-accounts', PROJ && slug(PROJ), span_[0] === span_[1] ? span_[0] : `${span_[0]}_${span_[1]}`]
+    .filter(Boolean).join('-') + '.html';
+  let file = flag('--html', null) || name;
+  try { if (fs.statSync(file).isDirectory()) file = path.join(file, name); } catch {}
+  fs.writeFileSync(file, html(report));
+  console.log(`🐡 wrote ${path.resolve(file)}`);
+} else console.log(text(report));
+
+function change(r) {
+  if (r.before == null || r.after == null || !r.before) return { s: '', good: null };
+  const d = (r.after - r.before) / r.before;
+  return { s: `${d > 0 ? '+' : ''}${Math.round(d * 100)}%`, good: Math.abs(d) < 0.05 ? null : d * r.better > 0 };
+}
+
+function text(R) {
+  const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+  const C = (c, s) => tty ? `\x1b[${c}m${s}\x1b[0m` : s;
+  const dim = s => C('2', s), bold = s => C('1', s);
+  const filt = `${PROJ ? ` · ${F.clean(PROJ)}` : ''}${ACCT ? ` · ${F.clean(ACCT)}` : ''}`;
+  const o = [];
+  const H = (title, cols, pad) => o.push(bold(title) + dim(' '.repeat(Math.max(1, pad - title.length)) + cols));
+  if (R.mode === 'compare') {
+    const b = R.before.A, a = R.after.A;
+    o.push(`🐡 puffr burn: before and after ${bold(R.change)}${filt}`);
+    o.push(dim(`   before ${b.from} → ${b.to} (${b.sessions} sessions, ${usd(b.usd)}) · after ${a.from} → ${a.to} (${a.sessions} sessions, ${usd(a.usd)})`));
+    o.push('');
+    o.push(dim(`  ${'metric'.padEnd(32)} ${'before'.padStart(9)} ${'after'.padStart(9)}  change`));
+    for (const r of R.rows) {
+      const c = change(r);
+      o.push(`  ${r.label.padEnd(32)} ${(r.before == null ? '–' : r.fmt(r.before)).padStart(9)} ${(r.after == null ? '–' : r.fmt(r.after)).padStart(9)}  ${c.good == null ? dim(c.s) : C(c.good ? '32' : '31', c.s)}`);
+    }
+    o.push(dim('  Rates are per day or per unit, so periods of different length compare fairly. Green moved the right way.'));
+    o.push('');
+    o.push(bold(`━━ AFTER: ${a.from} → ${a.to} ━━`) + dim('   (puffr-burn --since <date> --until <date> for the before period in full)'));
+    o.push('');
+    period(R.after);
+  } else {
+    o.push(`🐡 puffr burn: ${R.A.from} → ${R.A.to}${windowNote(R.A)}${filt} · ${R.A.sessions} sessions · ${bold(usd(R.A.usd))} ${dim('≈ API list price')}`);
+    if (CUSTOM_NOTE) o.push(dim(`   ${CUSTOM_NOTE}`));
+    o.push('');
+    period(R);
+  }
+  return o.join('\n');
+
+  function period({ A, practices: PR, insights: IN, puffr: FC, ucef: UC, git: GT }) {
+    const T = A.usd, D = drivers(A), G = agentRows(A);
+    if (IN.length) {
+      H('INSIGHTS', 'saving / month', 60);
+      IN.slice(0, 6).forEach((x, i) => {
+        o.push(`  ${i + 1}. ${bold(x.title.padEnd(50))} ${C('32', ('≈' + usd(x.save)).padStart(9))}`);
+        o.push(dim(`     ${x.detail}`));
+        o.push(`     ${x.action}`);
+      });
+      o.push(dim(`  Each saving is computed from this period and scaled to 30 days. They overlap, so don't add them up.${shortNote(A)}`));
+      o.push('');
+    }
+    if (UC) {
+      H('UCEF TOKENS SAVED', 'estimated', 60);
+      o.push(`  ${bold(usd(UC.monthlyUsd))} modeled monthly saving`);
+      o.push(`  ${k(UC.reqs)} UCEF-run requests  →  ~${k(UC.vanillaTurns)} vanilla-equiv. turns  (+${k(UC.extraTurns)})`);
+      o.push(`  ${usd(UC.usd)} actual UCEF spend  →  ~${usd(UC.vanillaUsd)} vanilla-equiv. spend  (saved ${usd(UC.savedUsd)} this window)`);
+      o.push(dim(`  ${UCEF_METHODOLOGY}`));
+      o.push('');
+    }
+    if (Object.keys(A.tools).length > 1 || A.tools.codex) {
+      H('BY TOOL', 'spend   sessions   requests   input   cached   output', 44);
+      for (const [n, x] of Object.entries(A.tools).sort((p, q) => q[1].usd - p[1].usd)) {
+        o.push(`  ${(n === 'codex' ? 'Codex' : 'Claude Code').padEnd(28)} ${(x.unpriced && !x.usd ? 'unpriced' : usd(x.usd)).padStart(10)}  ${String(x.sessions).padStart(8)}  ${k(x.reqs).padStart(9)}  ${k(x.tokens[0] + x.tokens[2] + x.tokens[3]).padStart(6)}  ${k(x.tokens[1]).padStart(7)}  ${k(x.tokens[4]).padStart(7)}`);
+      }
+      if ((A.tools.codex || {}).unpriced) o.push(dim('  Codex models have no price in puffr: add your prices to ~/.puffr/prices.json as {"models": {"<model>": {"input": $/MTok, "cached": $/MTok, "output": $/MTok}}} to see dollars.'));
+      o.push('');
+    }
+    H('BY ACCOUNT', 'spend  share  sessions', 70);
+    for (const [n, x] of Object.entries(A.accounts).sort((p, q) => q[1].usd - p[1].usd)) {
+      o.push(`  ${n.slice(0, 66).padEnd(66)} ${(n.startsWith('Codex') && !x.usd ? 'unpriced' : usd(x.usd)).padStart(8)}  ${pct(T ? x.usd / T : 0).padStart(5)}  ${String(x.sessions).padStart(8)}`);
+    }
+    o.push(dim('  $ is API list price. Subscription plans (Pro, Max, Team) don\'t bill per token, so there it shows weight, not a bill.'));
+    o.push('');
+    H('BY PROJECT', `spend  share  sessions  opus-exec  restores${GT ? '  commits   +lines  $/commit' : ''}`, 39);
+    for (const [n, p] of Object.entries(A.projects).sort((x, y) => y[1].usd - x[1].usd).slice(0, 12)) {
+      const g = GT && GT[n];
+      o.push(`  ${n.slice(0, 34).padEnd(34)} ${usd(p.usd).padStart(9)}  ${pct(T ? p.usd / T : 0).padStart(5)}  ${String(p.sessions).padStart(8)}  ${(p.exec ? pct(p.opusExec / p.exec) : '–').padStart(9)}  ${usd(p.restoreUsd).padStart(8)}`
+        + (GT ? `  ${(g ? String(g.commits) : '–').padStart(7)}  ${(g ? k(g.ins) : '–').padStart(7)}  ${(g && g.commits ? usd(p.usd / g.commits) : '–').padStart(8)}` : ''));
+    }
+    o.push('');
+    H('BY SESSION NAME', 'spend  share  sessions', 52);
+    for (const [t, x] of Object.entries(A.tags).sort((p, q) => q[1].usd - p[1].usd).slice(0, 10)) {
+      o.push(`  ${t.padEnd(48)} ${usd(x.usd).padStart(8)}  ${pct(T ? x.usd / T : 0).padStart(5)}  ${String(x.sessions).padStart(8)}`);
+    }
+    o.push(dim('  Tags are the first word of /rename titles (ACME-…, ACO-…). Rename sessions to see spend by workstream.'));
+    o.push('');
+    H('TOP SESSIONS', 'spend   days  requests', 72);
+    for (const x of A.list.sort((p, q) => q.usd - p.usd).slice(0, 10)) {
+      o.push(`  ${x.title.slice(0, 40).padEnd(40)} ${x.project.slice(0, 26).padEnd(26)}  ${usd(x.usd).padStart(8)}  ${String(x.days).padStart(4)}  ${k(x.reqs).padStart(8)}  ${dim(x.id.slice(0, 8))}`);
+    }
+    o.push('');
+    const HR = (!A.dayOnly || A.hours <= 72) ? hourRows(A) : [];
+    if (HR.length) {
+      const top = Math.max(0.01, ...HR.map(r => r.usd));
+      H('BY HOUR', 'spend  prompts  where it went', 30);
+      for (const r of HR) {
+        const bar = r.usd >= 0.005 ? '▇'.repeat(Math.max(1, Math.round(r.usd / top * 16))) : dim('·');
+        const who = r.top.slice(0, 2).map(([n, v]) => `${n.slice(0, 28)} ${usd(v)}`).join(' · ');
+        o.push(`  ${r.label.padEnd(17)} ${(r.usd >= 0.005 ? usd(r.usd) : '–').padStart(8)}  ${String(r.prompts || '').padStart(7)}  ${bar.padEnd(16)} ${dim(who)}`);
+      }
+      o.push(dim('  Local time. Prompts are what you typed in main threads; spend includes subagents.'));
+      o.push('');
+    }
+    H('BY AGENT', 'spend  share  runs  per run', 52);
+    const ag = (n, x, runs, ind = '  ') => o.push(`${ind}${n.slice(0, 50 - ind.length).padEnd(50 - ind.length)} ${usd(x).padStart(8)}  ${pct(T ? x / T : 0).padStart(5)}  ${runs == null ? '    ' : String(runs).padStart(4)}  ${runs ? usd(x / runs).padStart(7) : ''}`);
+    ag('Your turns (main thread)', G.main.usd);
+    ag('UCEF specialists', G.ucef.usd, G.ucef.runs);
+    for (const r of G.list.filter(r => r.ucef).slice(0, 8)) ag(r.name.replace(/^ucef-/, ''), r.usd, r.runs, '    ');
+    ag('Other subagents', G.other.usd, G.other.runs);
+    for (const r of G.list.filter(r => !r.ucef).slice(0, 4)) ag(r.name, r.usd, r.runs, '    ');
+    o.push('');
+    H('BY WORK TYPE', 'spend  share  requests', 52);
+    for (const [c, w] of Object.entries(A.work).sort((a, b) => b[1].usd - a[1].usd)) {
+      o.push(`  ${(WORK[c] || c).padEnd(48)} ${usd(w.usd).padStart(8)}  ${pct(T ? w.usd / T : 0).padStart(5)}  ${k(w.reqs).padStart(8)}`);
+    }
+    o.push(dim(`  + compaction summary calls ≈${usd(A.compactCallUsd)} (estimated; transcripts don't record them, so not in the totals)`));
+    o.push('');
+    H('COST DRIVERS', 'spend  share', 52);
+    for (const [n, v] of D.parts) {
+      o.push(`  ${n.padEnd(48)} ${usd(v).padStart(8)}  ${pct(T ? v / T : 0).padStart(5)}`);
+      if (n === 'Cache writes') for (const [w, x] of D.writes) if (x >= 0.005) o.push(dim(`    ${w.padEnd(46)} ${usd(x).padStart(8)}`));
+    }
+    o.push(`  ${dim('average context per request')} ${k(D.avgCtx)} ${dim('· main thread')} ${usd(A.mainUsd)} ${dim('· subagents')} ${usd(A.subUsd)} (${pct(T ? A.subUsd / T : 0)})`);
+    o.push(`  ${dim('fixed prompt overhead')} ≈${k(D.prefixTok)} ${dim('tokens per request ≈')} ${usd(A.prefixUsd)} ${dim('· prompts')} ${A.prompts} ${dim('·')} ${D.perPrompt.toFixed(1)} ${dim('requests per prompt')}`);
+    o.push('');
+    H('BY MODEL', 'spend  share   requests   cache read   cache write   output', 34);
+    for (const [m, x] of Object.entries(A.models).sort((p, q) => q[1].usd - p[1].usd)) {
+      o.push(`  ${m.slice(0, 26).padEnd(26)} ${usd(x.usd).padStart(9)}  ${pct(T ? x.usd / T : 0).padStart(5)}  ${k(x.u[5]).padStart(9)}  ${k(x.u[1]).padStart(11)}  ${k(x.u[2] + x.u[3]).padStart(12)}  ${k(x.u[4]).padStart(7)}`);
+    }
+    o.push('');
+    o.push(bold('PRACTICES'));
+    for (const p of PR) {
+      o.push(`  ${p.warn ? C('33', '▲') : C('32', '✓')} ${bold(p.title.padEnd(30))} ${p.value}`);
+      o.push(dim(`    ${p.tip}`));
+    }
+    o.push('');
+    o.push(bold('VALUE') + dim(' (rough proxies)'));
+    o.push(`  ${A.commits} commits by Claude · ${A.prs} PRs · ${A.edits} file edits · ${usd(per(T, A.commits))} per commit · ${usd(per(T, A.prs))} per PR`);
+    if (GT) {
+      const g = Object.values(GT).reduce((a, x) => ({ c: a.c + x.commits, i: a.i + x.ins, d: a.d + x.del, f: a.f + x.files }), { c: 0, i: 0, d: 0, f: 0 });
+      const gUsd = Object.entries(GT).reduce((a, [n]) => a + ((A.projects[n] || {}).usd || 0), 0);
+      o.push(`  git: ${g.c} commits · +${k(g.i)} / -${k(g.d)} lines · ${k(g.f)} files across ${Object.keys(GT).length} repo projects · ${usd(per(gUsd, g.c))} per commit · ${usd(per(gUsd, (g.i + g.d) / 1000))} per 1k lines`);
+      o.push(dim('  git counts every non-merge commit in repos your sessions ran in, by anyone; projects without a repo are not included.'));
+    } else o.push(dim('  add --git (or --full) for commits and lines changed per repo'));
+    o.push('');
+    o.push(bold('WHAT PUFFR COSTS'));
+    o.push(`  ${dim('this report')} $0 ${dim('(local code, no model calls) · run inside a session via /puffr:burn it adds ≈')}${k(o.join('\n').length / 4)} ${dim('tokens to that session')}`);
+    o.push(`  ${dim('skill listings + banner')} ≈${k(FC.skillTok)} ${dim('tokens on every request ≈')} ${usd(FC.skillsUsd)} ${dim('this period')} · ${dim('Haiku labels')} ${usd(FC.haiku.usd)} ${dim(`(${FC.haiku.calls} calls)`)}`);
+    if (A.unpriced.length) o.push(dim(`  unpriced models (tokens counted, $ not): ${A.unpriced.join(', ')}`));
+    o.push(dim('  Compare a habit change: puffr-burn --since-change YYYY-MM-DD   Share it: puffr-burn --html'));
+  }
+}
+
+// --- value: what the spend produced, as a box with one headline number ---
+function valueBox(A, T, gsum, gUsd, GT, e) {
+  const tile = (v, l, tip) => `<div data-tip="${e(tip)}"><b>${e(v)}</b><span>${e(l)}</span></div>`;
+  const lines = gsum ? gsum.i + gsum.d : 0;
+  const hero = A.prs ? [usd(T / A.prs), 'spent per pull request'] : A.commits ? [usd(T / A.commits), 'spent per commit by Claude']
+    : gsum && gsum.c ? [usd(gUsd / gsum.c), 'spent per git commit'] : ['–', 'no commits or PRs in this period'];
+  const made = [A.prs && `opened ${A.prs} pull request${A.prs === 1 ? '' : 's'}`, A.commits && `made ${A.commits} commit${A.commits === 1 ? '' : 's'}`,
+    A.edits && `edited files ${A.edits.toLocaleString('en-US')} times`].filter(Boolean);
+  const sum = `For ${usd(T)} of usage, Claude ${made.length ? made.join(', ') : 'made no commits or pull requests'}.`
+    + (gsum && gsum.c ? ` The repos it worked in got ${gsum.c} commits and ${k(lines)} changed lines (+${k(gsum.i)} / −${k(gsum.d)}) in this period.` : '');
+  return `<h2>Value <small>estimated</small></h2>
+<div class="ucef-box value-box">
+  <div class="hero"><b>${e(hero[0])}</b><span>${e(hero[1])}</span></div>
+  <p class="vsum">${e(sum)}</p>
+  <div class="grid">
+    ${tile(A.prs, 'pull requests', 'PR links Claude Code recorded in your sessions during this period.')}
+    ${tile(A.commits, 'commits by Claude', 'git commit commands Claude ran in your sessions. Can exceed git commits: commits on branches that were later squash-merged no longer show in the history.')}
+    ${tile(A.edits.toLocaleString('en-US'), 'file edits', 'Edit, Write and MultiEdit calls. One file edited five times counts five.')}
+    ${tile(usd(per(T, A.prs)), 'per pull request', 'Total spend divided by pull requests.')}
+    ${tile(usd(per(T, A.commits)), 'per Claude commit', 'Total spend divided by commits Claude made.')}
+    ${gsum ? tile(gsum.c, 'git commits (all authors)', 'Non-merge commits in repos your sessions worked in, by anyone, including people working by hand.') : ''}
+    ${gsum ? tile(k(lines), 'lines changed', `+${k(gsum.i)} added / −${k(gsum.d)} removed across ${k(gsum.f)} file changes in ${Object.keys(GT).length} repo projects.`) : ''}
+    ${gsum ? tile(usd(per(gUsd, gsum.c)), 'per git commit', 'Spend in projects with a repo, divided by their git commits.') : ''}
+    ${gsum ? tile(usd(per(gUsd, lines / 1000)), 'per 1k lines', 'Spend in projects with a repo, per thousand lines added or removed.') : ''}
+  </div>
+</div>
+<p class="note">How to read this: these are rough measures of output, not of quality. A PR can be one line or a whole feature, and docs, research and planning produce no commits. Use them to compare periods and workstreams, not as a verdict.${gsum ? ' git figures count everyone\'s commits in those repos; projects without a local repo are left out.' : ' Add --git (or use --html, which includes it) for commits and lines from the repos themselves.'}</p>`;
+}
+
+// The plain-English rules (comments stripped) and the edits Haiku made from them,
+// with the status on the right of the header like Insights.
+function rulesBox(e) {
+  if (!CUSTOM_NOTE) return '';
+  const lines = F.reportPromptText().split('\n').map(l => l.trim()).filter(Boolean);
+  const edits = [
+    ...Object.entries(RULES.project_aliases || {}).map(([a, b]) => `project ${a} → ${b}`),
+    ...Object.entries(RULES.tag_aliases || {}).map(([a, b]) => `tag ${a} → ${b}`),
+    ...Object.entries(RULES.account_labels || {}).map(([a, b]) => `account ${a} → ${b}`),
+    ...(RULES.hide_projects || []).map(p => `hide project ${p}`),
+  ];
+  return `<h2>Report rules <small>${e(CUSTOM_NOTE.replace(F.HOME, '~'))}</small></h2><ul class="prac rules">${lines.map(l => `<li><b>${e(l)}</b></li>`).join('')}${edits.length ? `<li><small>${edits.map(e).join(' · ')}</small></li>` : ''}</ul>`;
+}
+
+function html(R) {
+  const { e, td, row, table } = RP;
+  const $ = v => [e(usd(v)), v == null ? null : v], P = (v, of) => [e(pct(of ? v / of : 0)), of ? v / of : 0], K = v => [e(k(v)), v], N = v => [String(v), v];
+  const filt = [PROJ && `project ${PROJ}`, ACCT && `account ${ACCT}`].filter(Boolean).join(', ');
+  const round = o => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v >= 0.005).map(([k2, v]) => [k2, +v.toFixed(2)]));
+  const DRIVER_TIP = {
+    'Cache reads (context re-read every request)': 'Every request re-sends the conversation so far. Cached tokens cost about a tenth of new input, but with long contexts they add up to most of the bill.',
+    'Cache writes': 'New tokens added to the cache: each turn\'s growth, plus full rewrites when the cache was cold or invalidated (breakdown below).',
+    'Output (including thinking)': 'Tokens the model wrote, thinking included. Priced at about 5× input.',
+    'Uncached input': 'Input that missed the cache entirely. Usually tiny in Claude Code.',
+    'growth': 'Normal cost of a conversation getting longer: the new messages and tool results of each turn.',
+    'returns after the cache expired': 'You came back after the cache TTL (5m or 1h) and the whole context was written again. Compact before a break to shrink this.',
+    'session starts': 'The first request of each session writes the system prompt, tools and CLAUDE.md to the cache.',
+    'compactions': 'After a compaction the summary replaces the history, so the cache is written from scratch.',
+    'model switches': 'Caches are per model: switching models mid-session rewrites the whole context.',
+    'prefix changes (tools, MCP, prompt)': 'Something early in the prompt changed (a tool, MCP server, skill or setting), invalidating the cache after it.',
+  };
+
+  function period({ A, practices: PR, insights: IN, puffr: FC, ucef: UC, git: GT }) {
+    const T = A.usd, D = drivers(A), G = agentRows(A);
+    const max = Math.max(1, ...Object.values(A.projects).map(p => p.usd));
+    const stat = (v, l, tip) => `<div data-tip="${e(tip)}"><b>${e(v)}</b><span>${e(l)}</span></div>`;
+    const blob = JSON.stringify(A.list.map(x => ({ i: x.id, t: x.title, p: x.project, a: x.account, g: x.tag, u: +x.usd.toFixed(2), h: x.harness, d: x.days, r: x.reqs, f: x.first, l: x.last,
+      md: round(x.md), wk: round(x.wk), ag: round(x.ag) }))).replace(/</g, '\\u003c');
+    const gsum = GT && Object.values(GT).reduce((a, x) => ({ c: a.c + x.commits, i: a.i + x.ins, d: a.d + x.del, f: a.f + x.files }), { c: 0, i: 0, d: 0, f: 0 });
+    const gUsd = GT ? Object.keys(GT).reduce((a, n) => a + ((A.projects[n] || {}).usd || 0), 0) : 0;
+    return `<script type="application/json" class="fd">${blob}</script><div class="stats">${stat(usd(T), 'at API list prices', 'Every request priced at Anthropic list price: input, cache reads, 5m and 1h cache writes, and output. Subagents included.')}${stat(A.sessions, 'sessions', 'Sessions with any activity in this period.')}${stat(A.prompts, 'prompts', 'Messages you typed in the main thread (tool results and system notices excluded).')}${stat(D.perPrompt.toFixed(1), 'requests per prompt', 'Model calls per prompt in the main thread. Each one re-reads the whole context.')}${stat(k(D.avgCtx), 'avg context', 'Tokens the average request sends: cached plus new. Cache reads are this times every request.')}${stat('≈' + k(D.prefixTok), 'prompt overhead', 'The first request of each session: system prompt, tools, skills, MCP and CLAUDE.md. Every request carries it.')}${gsum ? stat(gsum.c, 'git commits', 'Non-merge commits in the period in repos your sessions worked in.') : ''}</div>
+${UC ? `<h2>UCEF tokens saved <small>estimated, not measured</small></h2>
+<div class="ucef-box">
+  <div class="hero"><b>${e(usd(UC.savedUsd))}</b><span>estimated saving this period · ${e(pct(T ? UC.savedUsd / T : 0))} of spend</span></div>
+  <p class="vsum">UCEF specialist agents spent ${e(usd(UC.usd))}, ${e(pct(T ? UC.usd / T : 0))} of the ${e(usd(T))} total. puffr assumes the same work without UCEF would have taken ${e(pct(UCEF_BASELINE_REWORK_FACTOR))} more turns (${e(usd(UC.vanillaUsd))}). The difference is the estimate above. No vanilla run was measured.</p>
+  <div class="grid">
+    <div data-tip="Spend by subagents whose type starts with ucef- (ucef-core:*, ucef-business:*, …), read from each subagent's .meta.json."><b>${e(usd(UC.usd))}</b><span>UCEF agent spend</span></div>
+    <div data-tip="UCEF agent spend as a share of all spend in this period."><b>${e(pct(T ? UC.usd / T : 0))}</b><span>share of spend</span></div>
+    <div><b>${e(k(UC.reqs))}</b><span>UCEF-run requests</span></div>
+    <div><b>~${e(usd(UC.vanillaUsd))}</b><span>vanilla-equiv. spend</span></div>
+    <div><b>+${e(k(UC.extraTurns))}</b><span>extra turns, vanilla</span></div>
+    <div data-tip="The period's saving scaled to 30 days. Misleading for a short, intense window such as an event."><b>${e(usd(UC.monthlyUsd))}</b><span>scaled to a month</span></div>
+  </div>
+</div>
+<p class="note">Counts only UCEF-named subagents. Main-thread turns that follow the UCEF protocol and general-purpose agents a UCEF plan dispatched are not counted, so UCEF's real share is likely higher. UCEF's own routing, memory and verification agents are inside its spend and are not netted out. ${e(UCEF_METHODOLOGY)}</p>` : ''}
+${IN.length ? `<h2>Insights <small>saving per month</small></h2><ol class="insights">${IN.map(x => `<li><b>${e(x.title)}</b><span>≈${e(usd(x.save))}</span><small>${e(x.detail)}<br>${e(x.action)}</small></li>`).join('')}</ol>
+<p class="note">Each saving is computed from this period and scaled to 30 days. They overlap, so don't add them up.${e(shortNote(A))}</p>` : ''}
+${Object.keys(A.tools).length > 1 || A.tools.codex ? `<h2>By tool</h2>${table(['Tool', 'Spend', 'Sessions', 'Requests', 'Input', 'Cached', 'Output'], Object.entries(A.tools).sort((p, q) => q[1].usd - p[1].usd).map(([n, x]) =>
+  row([e(n === 'codex' ? 'Codex' : 'Claude Code'), x.unpriced && !x.usd ? ['unpriced', 0] : $(x.usd), N(x.sessions), K(x.reqs), K(x.tokens[0] + x.tokens[2] + x.tokens[3]), K(x.tokens[1]), K(x.tokens[4])], 0, ['harness', n])))}
+${(A.tools.codex || {}).unpriced ? '<p class="note">Codex models have no price in puffr. Add them to ~/.puffr/prices.json to see dollars; tokens are exact either way.</p>' : ''}` : ''}
+<h2>By account</h2>${table(['Account', 'Spend', 'Share', 'Sessions'], Object.entries(A.accounts).sort((p, q) => q[1].usd - p[1].usd).map(([n, x]) => row([e(n), $(x.usd), P(x.usd, T), N(x.sessions)], 0, ['account', n])))}
+<p class="note">Subscription plans (Pro, Max, Team) don't bill per token: there $ shows weight, not a bill.</p>
+<h2>By project</h2>${table(['Project', 'Spend', 'Share', 'Sessions', 'Opus exec', 'Cache restores', ...(GT ? ['Commits', '+Lines', '−Lines', '$/commit'] : [])],
+  Object.entries(A.projects).sort((x, y) => y[1].usd - x[1].usd).map(([n, p]) => { const g = GT && GT[n];
+    return row([e(n), [`<span class="bar" style="width:${Math.max(2, Math.round(p.usd / max * 60))}px"></span>${e(usd(p.usd))}`, p.usd], P(p.usd, T), N(p.sessions), p.exec ? P(p.opusExec, p.exec) : ['–', null], $(p.restoreUsd),
+      ...(GT ? [g ? N(g.commits) : ['–', null], g ? K(g.ins) : ['–', null], g ? K(g.del) : ['–', null], g && g.commits ? $(p.usd / g.commits) : ['–', null]] : [])], 0, ['project', n]); }))}
+<h2>By session name</h2>${table(['Tag (from /rename)', 'Spend', 'Share', 'Sessions'], Object.entries(A.tags).sort((p, q) => q[1].usd - p[1].usd).map(([t, x]) => row([e(t), $(x.usd), P(x.usd, T), N(x.sessions)], 0, ['tag', t])))}
+<p class="note">Tags are the first word of /rename titles (ACME-…, ACO-…). Rename sessions to see spend by workstream.</p>
+<h2>Sessions</h2>${table(['Session', 'Project', 'Account', 'Spend', 'Days', 'Requests'], A.list.slice().sort((p, q) => q.usd - p.usd).map(x =>
+  row([`${e(x.title || x.id.slice(0, 8))} <small>${e(x.id.slice(0, 8))}</small>`, e(x.project), e(x.account.replace(/ \(.*/, '')), $(x.usd), N(x.days), K(x.reqs)], 0, ['id', x.id])))}
+${(() => { const HR = hourRows(A); if (!HR.length) return ''; const top = Math.max(0.01, ...HR.map(r => r.usd));
+  return `<h2>By hour <small>local time</small></h2>${table(['Hour', 'Spend', 'Prompts', 'Requests', 'Where it went'], HR.map(r =>
+    row([e(r.label), [`<span class="bar" style="width:${r.usd >= 0.005 ? Math.max(2, Math.round(r.usd / top * 60)) : 0}px"></span>${r.usd >= 0.005 ? e(usd(r.usd)) : '–'}`, r.usd], N(r.prompts), K(r.reqs),
+      e(r.top.slice(0, 3).map(([n, v]) => `${n} ${usd(v)}`).join(' · '))])))}
+<p class="note">Prompts are what you typed in main threads; spend includes subagents. Empty hours are kept so gaps show.</p>`; })()}
+<h2>By agent</h2>${table(['Agent', 'Spend', 'Share', 'Runs', 'Per run'], [
+  row([e('Your turns (main thread)'), $(G.main.usd), P(G.main.usd, T), ['', null], ['', null]], 0, ['agent', '']),
+  row([e('UCEF specialists'), $(G.ucef.usd), P(G.ucef.usd, T), N(G.ucef.runs), $(per(G.ucef.usd, G.ucef.runs))], 0, ['agent', '@ucef']),
+  ...G.list.filter(x => x.ucef).map(x => row([e(x.name.replace(/^ucef-/, '')), $(x.usd), P(x.usd, T), N(x.runs), $(per(x.usd, x.runs))], 1, ['agent', x.name])),
+  row([e('Other subagents'), $(G.other.usd), P(G.other.usd, T), N(G.other.runs), $(per(G.other.usd, G.other.runs))], 0, ['agent', '@other']),
+  ...G.list.filter(x => !x.ucef).map(x => row([e(x.name), $(x.usd), P(x.usd, T), N(x.runs), $(per(x.usd, x.runs))], 1, ['agent', x.name]))])}
+<h2>By work type</h2>${table(['Work', 'Spend', 'Share', 'Requests', 'Per request'], Object.entries(A.work).sort((a, b) => b[1].usd - a[1].usd).map(([c, w]) =>
+  row([e(WORK[c] || c), $(w.usd), P(w.usd, T), K(w.reqs), [e(w.reqs ? `$${(w.usd / w.reqs).toFixed(3)}` : '–'), per(w.usd, w.reqs)]], 0, ['work', c])))}
+<p class="note">Each response counts once, under the highest-ranked tool it called. Compaction summary calls aren't in transcripts: ≈${e(usd(A.compactCallUsd))} estimated, not in the totals.</p>
+<h2>Cost drivers</h2>${table(['What the money paid for', 'Spend', 'Share'], D.parts.flatMap(([n, v]) => [row([e(n), $(v), P(v, T)], 0, DRIVER_TIP[n]),
+  ...(n === 'Cache writes' ? D.writes.filter(w => w[1] >= 0.005).map(([w, x]) => row([e(w), $(x), P(x, T)], 1, DRIVER_TIP[w.replace(/ \(.*$/, '')])) : [])]))}
+<p class="note">Main thread ${e(usd(A.mainUsd))} · subagents ${e(usd(A.subUsd))} (${e(pct(T ? A.subUsd / T : 0))}). Fixed prompt overhead (system prompt, tools, skills, CLAUDE.md) ≈${e(k(D.prefixTok))} tokens per request ≈ ${e(usd(A.prefixUsd))}.</p>
+<h2>By model</h2>${table(['Model', 'Spend', 'Share', 'Requests', 'Cache read', 'Cache write', 'Output'], Object.entries(A.models).sort((p, q) => q[1].usd - p[1].usd).map(([m, x]) =>
+  row([e(m), $(x.usd), P(x.usd, T), K(x.u[5]), K(x.u[1]), K(x.u[2] + x.u[3]), K(x.u[4])], 0, ['model', m])))}
+<h2>Practices</h2><ul class="prac">${PR.map(p => `<li class="${p.warn ? 'warn' : 'ok'}"><b>${e(p.title)}</b><span>${e(p.value)}</span><small>${e(p.tip)}</small></li>`).join('')}</ul>
+${valueBox(A, T, gsum, gUsd, GT, e)}
+<footer class="cost"><b>What puffr costs</b><dl>
+<dt>This report</dt><dd>$0: local code, no model calls. Run inside a session via /puffr:burn, its text adds ≈3k tokens to that session.</dd>
+<dt>Skill listings + banner</dt><dd>≈${e(k(FC.skillTok))} tokens on every request ≈ ${e(usd(FC.skillsUsd))} this period</dd>
+<dt>Haiku labels</dt><dd>${e(usd(FC.haiku.usd))} (${FC.haiku.calls} call${FC.haiku.calls === 1 ? '' : 's'}, opt-in)</dd>
+</dl></footer>`;
+  }
+
+  let title, body;
+  if (R.mode === 'compare') {
+    const b = R.before.A, a = R.after.A;
+    title = `before / after ${R.change}`;
+    body = `<p class="sub">Before ${e(b.from)} to ${e(b.to)}: ${b.sessions} sessions, ${e(usd(b.usd))}. After ${e(a.from)} to ${e(a.to)}: ${a.sessions} sessions, ${e(usd(a.usd))}.${filt ? ` Filtered: ${e(filt)}.` : ''}</p>${rulesBox(e)}
+${table(['Metric', 'Before', 'After', 'Change'], R.rows.map(r => { const c = change(r), d = r.before ? (r.after - r.before) / r.before : null;
+  return row([e(r.label), [e(r.before == null ? '–' : r.fmt(r.before)), r.before], [e(r.after == null ? '–' : r.fmt(r.after)), r.after], [`<span class="${c.good == null ? '' : c.good ? 'good' : 'bad'}">${e(c.s)}</span>`, d]]); }))}
+<p class="note">Rates are per day or per unit, so periods of different length compare fairly. Value per token stays a judgment call: pair this with the Smart Report's outcome questions.</p>
+<div class="tabs" role="tablist"><button role="tab" aria-selected="true" data-p="after">After · ${e(a.from)} → ${e(a.to)}</button><button role="tab" aria-selected="false" data-p="before">Before · ${e(b.from)} → ${e(b.to)}</button></div>
+<section class="panel" id="after">${period(R.after)}</section><section class="panel" id="before" hidden>${period(R.before)}</section>`;
+  } else {
+    title = `${R.A.from} → ${R.A.to}${windowNote(R.A)}`;
+    body = (filt ? `<p class="sub">Filtered: ${e(filt)}</p>` : '') + rulesBox(e) + period(R);
+  }
+  // Hover cards, the drill-down drawer and the before/after tabs. The shell supplies sortable tables and the fish.
+  const script = `const WORKL = ${JSON.stringify(WORK).replace(/</g, '\\u003c')};
+const money = v => v >= 1000 ? '$' + Math.round(v).toLocaleString('en-US') : v >= 100 ? '$' + Math.round(v) : '$' + v.toFixed(2);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const nameOf = (t, v) => t === 'harness' ? (v === 'codex' ? 'Codex' : 'Claude Code') : t === 'agent' ? (v === '' ? 'Your turns (main thread)' : v === '@ucef' ? 'UCEF specialists' : v === '@other' ? 'Other subagents' : v)
+  : t === 'work' ? (WORKL[v] || v) : v;
+const sumIf = (o, f) => Object.entries(o || {}).reduce((a, [k, x]) => a + (f(k) ? x : 0), 0);
+function pick(row) {
+  const t = row.dataset.ft, v = row.dataset.fv, all = JSON.parse(row.closest('.panel, body').querySelector('script.fd').textContent);
+  const amt = s => t === 'agent' ? (v === '@ucef' ? sumIf(s.ag, k => k.startsWith('ucef-')) : v === '@other' ? sumIf(s.ag, k => k && !k.startsWith('ucef-')) : s.ag[v] || 0)
+    : t === 'work' ? s.wk[v] || 0 : t === 'model' ? s.md[v] || 0 : s.u;
+  const keep = s => t === 'harness' ? s.h === v : t === 'project' ? s.p === v : t === 'account' ? s.a === v : t === 'tag' ? s.g === v : t === 'id' ? s.i === v : amt(s) > 0;
+  return { t, v, rows: all.filter(keep).map(s => ({ ...s, x: amt(s) })).sort((a, b) => b.x - a.x) };
+}
+function mix(rows, key, label) {
+  const o = {};
+  for (const s of rows) for (const [k, x] of Object.entries(s[key] || {})) o[k] = (o[k] || 0) + x;
+  const tot = Object.values(o).reduce((a, b) => a + b, 0) || 1;
+  return Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, x]) => label(k) + ' ' + Math.round(x / tot * 100) + '%').join(' · ');
+}
+const short = k => k.replace(/^claude-/, '').replace(/^ucef-/, '');
+function card(row) {
+  const { t, v, rows } = pick(row), box = document.createDocumentFragment(), tot = rows.reduce((a, s) => a + s.x, 0);
+  box.append(el('b', null, t === 'id' && rows[0] ? rows[0].t || v.slice(0, 8) : nameOf(t, v)));
+  if (t === 'id' && rows[0]) {
+    const s = rows[0];
+    box.append(el('p', null, money(s.u) + ' · ' + s.r + ' requests · ' + s.d + ' day' + (s.d === 1 ? '' : 's') + ' (' + s.f + ' → ' + s.l + ')'), el('p', 'dim', s.p + ' · ' + s.a), el('code', null, 'claude --resume ' + s.i));
+  } else box.append(el('p', null, money(tot) + ' across ' + rows.length + ' session' + (rows.length === 1 ? '' : 's') + (rows.length ? ' · ' + money(tot / rows.length) + ' each' : '')));
+  const dl = el('dl');
+  const line = (k, x) => { if (x) dl.append(el('dt', null, k), el('dd', null, x)); };
+  if (t !== 'model') line('Models', mix(rows, 'md', short));
+  if (t !== 'work') line('Work', mix(rows, 'wk', k => WORKL[k] || k));
+  if (t !== 'agent') line('Agents', mix(rows, 'ag', k => k === '' ? 'your turns' : short(k)));
+  if (t !== 'id') line('Top', rows.slice(0, 3).map(s => (s.t || s.i.slice(0, 8)).slice(0, 34) + ' ' + money(s.x)).join(' · '));
+  box.append(dl);
+  if (t !== 'id') box.append(el('small', null, 'Click for every session'));
+  return box;
+}
+const tip = el('div', 'tipcard'); tip.hidden = true; tip.setAttribute('role', 'tooltip'); document.body.append(tip);
+function place(x, y) {
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.max(8, Math.min(x + 14, innerWidth - r.width - 8)) + 'px';
+  tip.style.top = (y + 14 + r.height > innerHeight ? Math.max(8, y - r.height - 10) : y + 14) + 'px';
+}
+function show(target, x, y) {
+  tip.replaceChildren(target.dataset.ft ? card(target) : el('p', null, target.dataset.tip));
+  tip.hidden = false; place(x, y);
+}
+document.addEventListener('mouseover', ev => { const t = ev.target.closest('[data-ft], [data-tip]'); if (t && !ev.target.closest('.drawer')) show(t, ev.clientX, ev.clientY); else tip.hidden = true; });
+document.addEventListener('mousemove', ev => { if (!tip.hidden) place(ev.clientX, ev.clientY); });
+document.addEventListener('focusin', ev => { const t = ev.target.closest('[data-ft]'); if (t) { const r = t.getBoundingClientRect(); show(t, r.left + 40, r.bottom - 10); } });
+document.addEventListener('focusout', () => { tip.hidden = true; });
+// Drill-down: every session behind a row, in a drawer.
+const veil = el('div', 'veil'), drawer = el('aside', 'drawer'); veil.hidden = drawer.hidden = true;
+drawer.setAttribute('role', 'dialog'); drawer.setAttribute('aria-modal', 'true'); document.body.append(veil, drawer);
+const closeD = () => { veil.hidden = drawer.hidden = true; };
+veil.onclick = closeD;
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeD(); });
+function open(row) {
+  const { t, v, rows } = pick(row), tot = rows.reduce((a, s) => a + s.x, 0);
+  const x = el('button', 'x', '✕'); x.onclick = closeD; x.setAttribute('aria-label', 'Close');
+  const h = el('h2', null, nameOf(t, v));
+  const tbl = el('table', 's'), th = tbl.createTHead().insertRow(), tb = tbl.createTBody();
+  ['Session', 'Project', 'Account', 'Spend', 'Days', 'Requests'].forEach((c, i) => { const n = el('th', i > 2 ? 'n' : null, c); n.tabIndex = 0; th.append(n); });
+  for (const s of rows) {
+    const r = tb.insertRow();
+    r.append(el('td', null, (s.t || s.i.slice(0, 8)) + '  ' + s.i.slice(0, 8)), el('td', null, s.p), el('td', null, s.a.split(' (')[0]));
+    [[money(s.x), s.x], [s.d, s.d], [s.r, s.r]].forEach(([txt, val]) => { const c = el('td', 'n', String(txt)); c.dataset.v = val; r.append(c); });
+  }
+  const w = el('div', 'wrap'); w.append(tbl);
+  const parts = [x, h, el('p', 'sub', money(tot) + ' across ' + rows.length + ' sessions. Click a column to sort; Esc closes.')];
+  if (rows.length > 12) {
+    const box = el('div', 'tfilter'), input = el('input'); input.type = 'search'; input.placeholder = 'Filter ' + rows.length + ' sessions';
+    input.setAttribute('aria-label', 'Filter sessions'); box.append(input, el('span')); parts.push(box); filterable(box, tbl);
+  }
+  drawer.replaceChildren(...parts, w);
+  sortable(tbl); tip.hidden = true; veil.hidden = drawer.hidden = false; x.focus();
+}
+document.addEventListener('click', ev => { const r = ev.target.closest('tr[data-ft]'); if (r && !ev.target.closest('.drawer') && r.dataset.ft !== 'id') open(r); });
+document.addEventListener('keydown', ev => { const r = ev.target.closest && ev.target.closest('tr[data-ft]'); if (r && ev.key === 'Enter' && r.dataset.ft !== 'id') open(r); });
+for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => {
+  for (const x of document.querySelectorAll('.tabs button')) { x.setAttribute('aria-selected', x === b); document.getElementById(x.dataset.p).hidden = x !== b; }
+};`;
+  return RP.page({ title, body, script });
+}

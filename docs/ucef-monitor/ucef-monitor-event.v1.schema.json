@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucef.invalid/schemas/ucef-monitor-event.v1.schema.json",
+  "title": "UCEF Monitor Event v1",
+  "description": "One JSON object per line (JSONL). Closed-world envelope: producers MUST NOT emit undeclared keys; consumers MUST ignore unknown keys when schema_version is \"1\" and MUST reject (skip and count) any line whose schema_version is not exactly \"1\".",
+  "type": "object",
+  "required": ["schema_version", "event_id", "ts", "session_id", "workspace_id", "agent_id", "atom_id", "source", "provenance", "kind", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1" },
+    "event_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{7,95}$" },
+    "dedupe_key": { "description": "spec_revision 1.1: mandatory for hook_verdict, agent_run, phase_gate and decision; formats in spec.md section 4.4. Maximum 128 characters.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:|/-]{0,127}$" },
+    "ts": { "$ref": "#/$defs/ts" },
+    "seq": { "type": ["integer", "null"], "minimum": 0 },
+    "session_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$" },
+    "workspace_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+    "agent_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+    "atom_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" },
+    "source": {
+      "description": "Where the observation came from. 'adapter' marks an event synthesized in memory by a read-only monitor (for example source health); monitors never write it to disk.",
+      "enum": ["monitor_events", "audit_jsonl", "audit_jsonl_legacy", "ucef_db", "decision_telemetry", "permission_log", "hook_failures", "transcript", "subagent_transcript", "atom_registry", "adapter"]
+    },
+    "provenance": { "enum": ["emitted", "derived", "inferred"] },
+    "kind": { "enum": ["hook_verdict", "agent_run", "phase_gate", "decision", "session_meta"] },
+    "redaction": { "$ref": "#/$defs/redaction" },
+    "data": { "type": "object" },
+    "ext": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,39}$" },
+      "additionalProperties": {
+        "anyOf": [
+          { "$ref": "#/$defs/text120" },
+          { "type": ["number", "boolean", "null"] }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "enum": ["hook_verdict", "agent_run", "phase_gate", "decision"] } }, "required": ["kind"] },
+      "then": { "required": ["dedupe_key"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "hook_verdict" } }, "required": ["kind"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/hookVerdictData" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "agent_run" } }, "required": ["kind"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/agentRunData" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "phase_gate" } }, "required": ["kind"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/phaseGateData" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "decision" } }, "required": ["kind"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/decisionData" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "session_meta" } }, "required": ["kind"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/sessionMetaData" } } }
+    }
+  ],
+  "$defs": {
+    "ts": {
+      "type": "string",
+      "description": "RFC 3339 UTC with literal Z, 0 to 6 fractional digits.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?Z$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "noSecretNoControl": {
+      "description": "Free-text backstop: no C0/C1 control characters (terminal escape hijack) and no secret-shaped substrings. Mirrors the normative scrub classes in spec.md section 7; scrubbed placeholders of the form [REDACTED:class] are allowed.",
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$",
+      "not": {
+        "pattern": "\\bsk-[A-Za-z0-9_-]{16,}|\\bgh[pousr]_[A-Za-z0-9]{20,}|\\bgithub_pat_[A-Za-z0-9_]{20,}|\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b|\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{5,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\\b[Bb]earer\\s+[A-Za-z0-9._~+/=-]{16,}|://[^/\\s:@\\[]+:[^/\\s@\\[]+@|\\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL)[A-Z0-9_]*\\s*[=:]\\s*[^\\s'\"\\[]{6,}"
+      }
+    },
+    "text120": { "allOf": [{ "$ref": "#/$defs/noSecretNoControl" }, { "maxLength": 120 }] },
+    "text240": { "allOf": [{ "$ref": "#/$defs/noSecretNoControl" }, { "maxLength": 240 }] },
+    "token": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:+/-]{0,63}$" },
+    "modelId": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$" },
+    "modelTier": { "enum": ["opus", "sonnet", "haiku", "other", "unknown"] },
+    "judgeTier": { "enum": ["opus", "sonnet", "haiku", "other", "none", "unknown"] },
+    "nonNegInt": { "type": ["integer", "null"], "minimum": 0 },
+    "nonNegNum": { "type": ["number", "null"], "minimum": 0 },
+    "unit": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+    "redaction": {
+      "type": "object",
+      "required": ["policy", "level"],
+      "additionalProperties": false,
+      "properties": {
+        "policy": { "const": "v1" },
+        "level": { "enum": ["metadata_only", "truncated", "hashed", "scrubbed"] },
+        "secrets_scrubbed": { "type": "integer", "minimum": 0 },
+        "scrub_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["private_key", "jwt", "api_key", "github_token", "aws_key_id", "bearer", "url_userinfo", "env_assignment"] }
+        },
+        "truncated_fields": { "type": "array", "items": { "$ref": "#/$defs/token" } },
+        "hashed_fields": { "type": "array", "items": { "$ref": "#/$defs/token" } }
+      }
+    },
+    "usage": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "$ref": "#/$defs/nonNegInt" },
+        "output_tokens": { "$ref": "#/$defs/nonNegInt" },
+        "cache_read_input_tokens": { "$ref": "#/$defs/nonNegInt" },
+        "cache_creation_input_tokens": { "$ref": "#/$defs/nonNegInt" },
+        "cache_tokens": { "$ref": "#/$defs/nonNegInt" },
+        "basis": { "enum": ["per_message_deduped", "audit_record", "reported", "unknown"] }
+      },
+      "required": ["basis"]
+    },
+    "cost": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["basis", "usd"],
+      "properties": {
+        "usd": { "$ref": "#/$defs/nonNegNum" },
+        "basis": { "enum": ["reported", "estimated", "unknown"] },
+        "price_table_version": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$" }
+      },
+      "if": { "properties": { "basis": { "const": "estimated" } }, "required": ["basis"] },
+      "then": { "required": ["price_table_version"], "properties": { "price_table_version": { "type": "string" }, "usd": { "type": "number" } } }
+    },
+    "digest": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["sha256", "len", "basis"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "len": { "type": "integer", "minimum": 0 },
+        "basis": { "enum": ["verbatim", "scrubbed"] }
+      }
+    },
+    "hookVerdictData": {
+      "type": "object",
+      "required": ["hook_event", "hook_name", "hook_type", "verdict", "model_tier"],
+      "additionalProperties": false,
+      "properties": {
+        "hook_event": {
+          "enum": ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "PermissionDenied", "SubagentStart", "SubagentStop", "Stop", "PreCompact", "Notification", "Other"]
+        },
+        "hook_name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}$" },
+        "hook_type": { "enum": ["command", "prompt", "agent", "http", "mcp_tool", "unknown"] },
+        "model_tier": { "$ref": "#/$defs/judgeTier" },
+        "verdict": { "enum": ["allow", "bypass", "guidance", "warn", "block", "ok", "not_done"] },
+        "tool_name": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_:.*-]{1,128}$" },
+        "tool_use_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+        "command_head": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_./+-]{1,32}$" },
+        "input_digest": { "$ref": "#/$defs/digest" },
+        "reason_code": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9_:.-]{0,63}$" },
+        "reason_text": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/text240" }] },
+        "reason_sha256": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "latency_ms": { "$ref": "#/$defs/nonNegNum" },
+        "exit_code": { "type": ["integer", "null"] },
+        "fail_open": { "type": ["boolean", "null"] },
+        "judge": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "model": { "$ref": "#/$defs/modelId" },
+            "impossible": { "type": ["boolean", "null"] },
+            "continue_on_block": { "type": ["boolean", "null"] },
+            "turns": { "$ref": "#/$defs/nonNegInt" },
+            "usage": { "$ref": "#/$defs/usage" },
+            "cost": { "$ref": "#/$defs/cost" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "verdict": { "enum": ["ok", "not_done"] } }, "required": ["verdict"] },
+          "then": { "properties": { "hook_event": { "enum": ["Stop", "SubagentStop", "Other"] } } }
+        },
+        {
+          "if": { "properties": { "verdict": { "enum": ["bypass", "guidance"] } }, "required": ["verdict"] },
+          "then": { "properties": { "hook_event": { "enum": ["UserPromptSubmit", "Other"] } } }
+        },
+        {
+          "if": { "properties": { "hook_type": { "enum": ["prompt", "agent"] } }, "required": ["hook_type"] },
+          "then": { "properties": { "model_tier": { "enum": ["opus", "sonnet", "haiku", "other", "unknown"] } } }
+        },
+        {
+          "if": { "properties": { "hook_type": { "const": "command" } }, "required": ["hook_type"] },
+          "then": { "properties": { "model_tier": { "const": "none" } } }
+        }
+      ]
+    },
+    "agentRunData": {
+      "type": "object",
+      "required": ["agent_type", "lifecycle", "status", "model_tier"],
+      "additionalProperties": false,
+      "properties": {
+        "agent_type": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" },
+        "description": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/text120" }] },
+        "lifecycle": { "enum": ["start", "stop"] },
+        "status": { "enum": ["running", "succeeded", "failed", "cancelled", "unknown"] },
+        "model_id": { "$ref": "#/$defs/modelId" },
+        "model_tier": { "$ref": "#/$defs/modelTier" },
+        "model_source": { "enum": ["transcript_message_model", "agent_definition", "dispatch_override", "unknown"] },
+        "started_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/ts" }] },
+        "ended_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/ts" }] },
+        "duration_ms": { "$ref": "#/$defs/nonNegNum" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "cost": { "$ref": "#/$defs/cost" },
+        "spawn_depth": { "$ref": "#/$defs/nonNegInt" },
+        "parent_agent_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "background": { "type": ["boolean", "null"] },
+        "tool_calls": { "$ref": "#/$defs/nonNegInt" },
+        "stop_reason": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]{0,31}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "lifecycle": { "const": "start" } }, "required": ["lifecycle"] },
+          "then": { "properties": { "status": { "const": "running" } } }
+        },
+        {
+          "if": { "properties": { "lifecycle": { "const": "stop" } }, "required": ["lifecycle"] },
+          "then": { "properties": { "status": { "enum": ["succeeded", "failed", "cancelled", "unknown"] } } }
+        }
+      ]
+    },
+    "phaseGateData": {
+      "type": "object",
+      "required": ["phase", "transition"],
+      "additionalProperties": false,
+      "properties": {
+        "phase": { "enum": ["1", "1.5", "2", "3", "4", "5", "5.5", "6"] },
+        "transition": { "enum": ["enter", "exit", "gate_result", "skipped"] },
+        "gate": { "enum": ["completion", "constitutional", "field_stability", "consensus", "error_detection", null] },
+        "status": { "enum": ["pass", "fail", "unknown", null] },
+        "score": { "$ref": "#/$defs/unit" },
+        "threshold": { "$ref": "#/$defs/unit" },
+        "stability_mode": { "enum": ["convergent", "consolidating", "exploratory", null] },
+        "checkpoint": { "type": ["string", "null"], "pattern": "^[a-z0-9_]{1,40}$" },
+        "reason_code": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9_:.-]{0,63}$" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "transition": { "const": "gate_result" } }, "required": ["transition"] },
+          "then": { "required": ["gate", "status"], "properties": { "gate": { "type": "string" }, "status": { "enum": ["pass", "fail", "unknown"] } } }
+        }
+      ]
+    },
+    "decisionData": {
+      "type": "object",
+      "required": ["tier", "decision_class"],
+      "additionalProperties": false,
+      "properties": {
+        "tier": { "enum": ["deterministic", "jev", "llm"] },
+        "decision_class": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,63}$" },
+        "question_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$" },
+        "value": {
+          "description": "Closed-vocabulary token, number, boolean or null. Free text is never carried.",
+          "anyOf": [{ "$ref": "#/$defs/token" }, { "type": ["number", "boolean", "null"] }]
+        },
+        "value_provenance": { "enum": ["inferred", "defaulted", "supplied", null] },
+        "confidence": { "$ref": "#/$defs/unit" },
+        "floor": { "$ref": "#/$defs/unit" },
+        "latency_ms": { "$ref": "#/$defs/nonNegNum" },
+        "provider": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$" },
+        "model_id": { "$ref": "#/$defs/modelId" },
+        "path": { "enum": ["fast_path_accept", "fallback_llm", "deny", "defer", null] },
+        "fallback_reason": { "enum": ["below_floor", "no_corroboration", "registry_miss", "unavailable", "breaker_open", "canary_failed", null] },
+        "call_status": { "enum": ["success", "misconfigured", "error", "rate_limited", "unavailable", "null", null] },
+        "state_digest": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] },
+        "usage": { "$ref": "#/$defs/usage" },
+        "cost": { "$ref": "#/$defs/cost" }
+      }
+    },
+    "sourceHealth": {
+      "type": "object",
+      "required": ["source", "state"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "enum": ["monitor_events", "audit_jsonl", "audit_jsonl_legacy", "ucef_db", "decision_telemetry", "permission_log", "hook_failures", "transcript", "subagent_transcript", "atom_registry"] },
+        "state": { "enum": ["ok", "degraded", "missing", "unreadable", "schema_mismatch", "stale"] },
+        "reason_code": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9_:.-]{0,63}$" },
+        "last_event_ts": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/ts" }] },
+        "count": { "description": "spec_revision 1.1: aggregate record count summarized by this entry (for example fail-open-counts.jsonl rows). Counters are never verdicts.", "$ref": "#/$defs/nonNegInt" },
+        "read_mode": { "description": "spec_revision 1.1: 'snapshot' when a SQLite source was read through the labeled immutable=1 fallback.", "enum": ["ro", "snapshot", null] }
+      }
+    },
+    "sessionMetaData": {
+      "type": "object",
+      "required": ["lifecycle"],
+      "additionalProperties": false,
+      "properties": {
+        "lifecycle": { "enum": ["start", "end", "health"] },
+        "model_id": { "$ref": "#/$defs/modelId" },
+        "model_tier": { "$ref": "#/$defs/modelTier" },
+        "claude_version": { "type": ["string", "null"], "pattern": "^[0-9][0-9A-Za-z.+-]{0,31}$" },
+        "git_branch": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]{0,127}$" },
+        "project_ref": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$" },
+        "duration_ms": { "$ref": "#/$defs/nonNegNum" },
+        "success": { "type": ["boolean", "null"] },
+        "sources": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/sourceHealth" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "lifecycle": { "const": "health" } }, "required": ["lifecycle"] },
+          "then": { "required": ["sources"], "properties": { "sources": { "minItems": 1 } } }
+        }
+      ]
+    }
+  }
+}

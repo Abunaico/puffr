@@ -1,0 +1,11 @@
+# detailed: one labeled line per gauge, in plain words.
+#
+# "label: [...]" puts a label in front of the line; labels line up.
+lines:
+  - [fish, model, mode, ·, account, plan]
+  - context:      [context-bar, context-full, ·, context-tokens, ·, context-warning]
+  - 5-hour limit: [5h-used, ·, 5h-resets, 5h-clock, ·, 5h-pace-words]
+  - weekly limit: [7d-used, ·, 7d-resets, 7d-clock, ·, 7d-pace-words]
+  - prompt cache: [cache-words, cache-why, ·, nudge]
+  - cost:         [cost-words]
+  - [dir, ·, git]
