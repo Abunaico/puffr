@@ -14,7 +14,7 @@ SANDBOX=$(mktemp -d)
 trap 'rm -rf "$SANDBOX"' EXIT
 export HOME="$SANDBOX/home" XDG_CACHE_HOME="$SANDBOX/cache"
 mkdir -p "$HOME" "$XDG_CACHE_HOME"
-unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID PUFFR_MOOD PUFFR_PROFILE_DIRS NO_COLOR COLUMNS PUFFR_HUD_WIDTH
+unset CLAUDE_CONFIG_DIR CLAUDE_CODE_EXECPATH PUFFR_AUTONAME_CLAUDE ANTHROPIC_API_KEY CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID PUFFR_MOOD PUFFR_PROFILE_DIRS NO_COLOR COLUMNS PUFFR_HUD_WIDTH
 strip_ansi() { LC_ALL=C sed $'s/\033\\[[0-9;]*m//g'; }
 
 echo "— statusline degradation —"
@@ -1030,6 +1030,10 @@ chk "hooks.json: one UserPromptSubmit command (guard rides the autoname hook)" "
 
 echo "— cold-return guard: hook —"
 TG=$SANDBOX/guard; mkdir -p "$TG/.puffr/autoname"
+# Autoname's background worker runs `claude -p` after the 3rd prompt. Point it at a stub that only
+# records the call, so no guard test can reach a real claude.
+printf '#!/bin/sh\necho called >> "%s/stub.calls"\nexit 1\n' "$TG" > "$TG/stub-claude"; chmod +x "$TG/stub-claude"
+export PUFFR_AUTONAME_CLAUDE="$TG/stub-claude"
 iso() { node -e 'console.log(new Date(Date.now()-process.argv[1]*1000).toISOString())' "$1"; }
 # arow <age-secs> <model> <input> <cache-read> <write-5m> <write-1h>: one assistant row
 arow() { printf '{"type":"assistant","timestamp":"%s","message":{"model":"%s","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s,"cache_creation":{"ephemeral_5m_input_tokens":%s,"ephemeral_1h_input_tokens":%s}}}}\n' "$(iso "$1")" "$2" "$3" "$4" "$(($5+$6))" "$5" "$6"; }
@@ -1081,6 +1085,8 @@ out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "first 
 out=$(gh $S); rc=$?; chk "second prompt, same cold period: silent" "$rc:$out" "0:"
 arow 3900 claude-opus-5-5 10 398990 0 1000 >> "$TG/$S.jsonl"
 out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "a new cold period warns again" || bad "a new cold period warns again"
+for _ in $(seq 1 50); do [ -s "$TG/stub.calls" ] && break; sleep 0.1; done
+[ -s "$TG/stub.calls" ] && ok "3rd prompt's autoname worker ran the stub, not a real claude" || bad "autoname worker did not reach the stub"
 
 printf 'guard.cold=on\nautoname=off\n' > "$GCFG"
 S=gnoan-0011; cold1h > "$TG/$S.jsonl"
@@ -1117,6 +1123,44 @@ printf '{"title":"ACO-TITLE-ONLY","from":1}' > "$TG/.puffr/autoname/$S.pending"
 out=$(gh $S)
 chk "guard off: title output byte-identical to before" "$out" '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","sessionTitle":"ACO-TITLE-ONLY"}}'
 
+# A crash must not use up the warning: state is written only after the message exists.
+mkdir -p "$TG/plug/bin" "$TG/plug/lib"; cp bin/puffr-autoname "$TG/plug/bin/"
+printf 'throw new Error("broken lib");\n' > "$TG/plug/lib/puffr.js"
+gp() { gev "$1" "$TG/$1.jsonl" | HOME=$TG node "$TG/plug/bin/puffr-autoname" hook; }
+printf 'guard.cold=on\n' > "$GCFG"
+S=gcrsh-0030; cold1h > "$TG/$S.jsonl"
+out=$(gp $S); rc=$?; chk "broken lib: silent, exit 0" "$rc:$out" "0:"
+[ -e "$TG/.puffr/guard/$S.json" ] && bad "broken lib leaves no state behind" || ok "broken lib leaves no state behind"
+cp lib/puffr.js "$TG/plug/lib/puffr.js"
+out=$(gp $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "repaired lib: same cold period still warns" || bad "repaired lib: same cold period still warns (got: $out)"
+out=$(gp $S); chk "after the warning went out: silent again" "$out" ""
+
+# Haiku 5.5 over 100k pays 5x on every rate; the guard only fires above 100k, so the figure is the 5x tier.
+S=ghaik-0031; { arow 4000 claude-haiku-5-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'about $0.40 (list price, Haiku 5.5, 1h)'*) ok "Haiku 5.5 400k 1h: \$0.40 (5x tier)";; *) bad "Haiku 5.5 400k 1h (got: $msg)";; esac
+S=ghaik-0032; { arow 400 claude-haiku-5-5 10 398990 1000 0; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'about $0.25 (list price, Haiku 5.5, 5m)'*) ok "Haiku 5.5 400k 5m: \$0.25 (5x tier)";; *) bad "Haiku 5.5 400k 5m (got: $msg)";; esac
+S=ghaik-0033; { arow 4000 claude-haiku-4-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'about $0.80 (list price, Haiku 4.5, 1h)'*) ok "Haiku 4.5 is not scaled";; *) bad "Haiku 4.5 (got: $msg)";; esac
+
+# A newest row cut off mid-write is no data; a tail that starts mid-line is normal.
+S=gcut1-0034; { cold1h; printf '{"type":"assistant","timestamp":"2026-10-3'; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "partial last line over an older cold row: silent" "$rc:$out" "0:"
+S=gcut2-0035; { node -e 'const r=JSON.stringify({type:"user",timestamp:"2026-01-01T00:00:00Z",message:{role:"user",content:"y".repeat(1013)}})+"\n";process.stdout.write(r.repeat(300))'; cold1h; } > "$TG/$S.jsonl"
+tail -c 262144 "$TG/$S.jsonl" | head -1 | grep -q '^{' && bad "fixture tail starts mid-line" || ok "fixture tail starts mid-line"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "tail starting mid-line: bad first line dropped, still warns" || bad "tail starting mid-line still warns (got: $out)"
+
+# No ephemeral breakdown: the tier is unknown, so no guess.
+S=gnobk-0036; { printf '{"type":"assistant","timestamp":"%s","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":398990,"cache_creation_input_tokens":1000}}}\n' "$(iso 4000)"; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "no cache_creation breakdown: silent" "$rc:$out" "0:"
+S=gnobk-0037; { printf '{"type":"assistant","timestamp":"%s","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":398990,"cache_creation_input_tokens":1000,"cache_creation":{}}}}\n' "$(iso 4000)"; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "empty cache_creation object: silent" "$rc:$out" "0:"
+
+rm -f "$GCFG"
+
 # Reads: count .jsonl opens and lib/puffr.js loads through a preload.
 cat > "$TG/count.js" <<'EOF'
 const fs = require('fs'), M = require('module');
@@ -1134,6 +1178,7 @@ chk "guard on + warm: one extra transcript read, lib not loaded" "$(cnt $S)" "2 
 S=gcnt-0023; cold1h > "$TG/$S.jsonl"
 chk "guard on + cold: one extra transcript read, lib loaded once" "$(cnt $S)" "2 1"
 rm -f "$GCFG"
+unset PUFFR_AUTONAME_CLAUDE
 
 echo "— ucef panel —"
 # Contract fixtures, redaction vectors, every adapter, read-only guarantees, CLI exit codes.

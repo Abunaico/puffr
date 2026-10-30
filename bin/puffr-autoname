@@ -70,6 +70,10 @@ function lastCustomTitle(file) {
 const COLD_TOKENS = 100000;     // warn only when the context to rewrite is larger than this
 const TAIL_BYTES = 262144;      // transcript tail read, as statusline.sh does
 const GUARD_DIR = path.join(DIR, 'guard');
+// Haiku 5.5 charges 5x on every rate once a request's prompt is over 100,000 tokens (lib/puffr.js
+// PRICES note: its table holds the lower tier only). The guard fires only above COLD_TOKENS, which is
+// the same edge, so every Haiku 5.5 figure it prints is the long-context tier.
+const HAIKU_55_LONG_CONTEXT_X = 5;
 
 // Last real assistant row in the tail, with the facts the warning needs. Null when anything is missing.
 function lastAssistant(file) {
@@ -80,8 +84,14 @@ function lastAssistant(file) {
     const buf = Buffer.alloc(len);
     fs.readSync(fd, buf, 0, len, size - len);
     const lines = buf.toString('utf8').split('\n');
-    let compacted = false, last = null, tier = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
+    // The transcript may lag or be mid-write: a final line that does not parse means the newest
+    // row is unknown, so say nothing. (A bad first line is just a tail that began mid-line.)
+    let end = lines.length - 1;
+    while (end >= 0 && !lines[end].trim()) end--;
+    if (end < 0) return null;
+    try { JSON.parse(lines[end]); } catch { return null; }
+    let compacted = false, last = null, tier = null, tierSeen = false;
+    for (let i = end; i >= 0; i--) {
       const l = lines[i];
       const isBoundary = l.includes('compact_boundary'), isAsst = /"type": ?"assistant"/.test(l);
       if (!isBoundary && !isAsst) continue;
@@ -91,10 +101,13 @@ function lastAssistant(file) {
       const u = m && m.usage;
       if (!u || typeof m.model !== 'string' || m.model === '<synthetic>') continue;
       if (!last) last = { model: m.model, at: e.timestamp, u };
-      if (tier === null && Number(u.cache_creation_input_tokens) > 0) {
-        tier = Number(u.cache_creation && u.cache_creation.ephemeral_1h_input_tokens) > 0 ? 3600 : 300;
+      if (!tierSeen && Number(u.cache_creation_input_tokens) > 0) {
+        tierSeen = true;
+        // Without the 5m/1h breakdown the tier is unknown; it is not assumed to be 5m.
+        const cc = u.cache_creation, h = cc && cc.ephemeral_1h_input_tokens, f = cc && cc.ephemeral_5m_input_tokens;
+        if (Number.isFinite(Number(h)) && h != null || Number.isFinite(Number(f)) && f != null) tier = Number(h) > 0 ? 3600 : 300;
       }
-      if (last && tier !== null) break;
+      if (last && tierSeen) break;
     }
     return last && tier !== null ? { ...last, tier, compacted } : null;
   } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
@@ -113,20 +126,24 @@ function coldWarning(ev) {
   if (!Number.isFinite(at) || !(ctx > COLD_TOKENS) || !(Date.now() > at + a.tier * 1000)) return null;
   const stateFile = path.join(GUARD_DIR, `${id}.json`), prior = readJSON(stateFile);
   if (prior && prior.warnedFor === a.at) return null;
+  // Loaded only now, so the off path and the warm path never pay for it. The message is built
+  // before any state is written: a crash here leaves the warning available for the next prompt.
+  const lib = require(path.join(__dirname, '..', 'lib', 'puffr.js'));
+  const p = lib.price(a.model);
+  const tierName = a.tier === 3600 ? '1h' : '5m';
+  let cost = '';
+  if (p) {
+    // rewriteCost is the extra over a warm read; add the read back for the full rewrite.
+    let full = lib.rewriteCost(a.model, a.tier === 300 ? ctx : 0, a.tier === 3600 ? ctx : 0) + ctx * p.r / 1e6;
+    if (!p.user && /haiku-5-5/.test(a.model)) full *= HAIKU_55_LONG_CONTEXT_X;   // every rate scales together
+    cost = ` about $${full.toFixed(2)} (list price, ${modelName(a.model)}, ${tierName})`;
+  }
+  const text = `puffr: cache cold on this ${Math.round(ctx / 1000)}k session; next turn rewrites it${cost || ` (${tierName} cache)`}. Consider /compact or /clear.`;
   fs.mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 });
   const tmp = `${stateFile}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ warnedFor: a.at }), { mode: 0o600 });
   fs.renameSync(tmp, stateFile);
-  // Loaded only now, so the off path and the warm path never pay for it.
-  const lib = require(path.join(__dirname, '..', 'lib', 'puffr.js'));
-  const p = lib.price(a.model);
-  let cost = '';
-  if (p) {
-    // rewriteCost is the extra over a warm read; add the read back for the full rewrite.
-    const full = lib.rewriteCost(a.model, a.tier === 300 ? ctx : 0, a.tier === 3600 ? ctx : 0) + ctx * p.r / 1e6;
-    cost = ` about $${full.toFixed(2)} (list price, ${modelName(a.model)}, ${a.tier === 3600 ? '1h' : '5m'})`;
-  }
-  return `puffr: cache cold on this ${Math.round(ctx / 1000)}k session; next turn rewrites it${cost || ` (${a.tier === 3600 ? '1h' : '5m'} cache)`}. Consider /compact or /clear.`;
+  return text;
 }
 
 // Autoname's half of the hook: returns the title to apply, or null.
