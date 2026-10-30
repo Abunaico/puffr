@@ -18,7 +18,7 @@ puffr-config reset              # everything back on
 
 Arguments the user passed: "$ARGUMENTS"
 
-1. **Arguments given** (e.g. `off hud.cost`, "hide the fish", "turn the banner back on"): map them to feature keys, run `puffr-config on|off <keys>`, and show the resulting table.
+1. **Arguments given** (e.g. `off hud.cost`, "hide the fish", "turn the banner back on"): map them to feature keys, run `puffr-config on|off <keys>`, and show the resulting table. Choices like `model.haiku` and `guard.cold` are not switches: they use `puffr-config set <key> <value>`, not `on|off`.
 2. **No arguments:** run `puffr-config --json` to get the current state, then ask with AskUserQuestion, four `multiSelect: true` questions, pre-describing each option with its current state (e.g. "Git branch (on)"). The user picks the features they want **on**:
    - "HUD line 1": `hud.fish` (pufferfish), `hud.mode` (effort + style), `hud.git` (git branch), `hud.account` (account)
    - "HUD line 2": `hud.rate` (5h/7d meters), `hud.reset` (reset countdown), `hud.pace` (pace projection), `hud.cache` (cache countdown)

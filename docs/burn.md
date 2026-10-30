@@ -182,6 +182,12 @@ Costs are estimates at Anthropic API list prices, from the usage each response r
 response streamed over several lines counts once, and subagents are included. On a subscription
 they show relative weight, not your bill.
 
+Known limit (Haiku 5.5): a request whose prompt is over 100,000 tokens is priced at 5× on every
+rate. Reports use the lower tier only, so those requests are understated by up to 5×. Exactly
+100,000 tokens is the lower tier. Day buckets hold no per-request prompt length, so the report
+cannot tell which Haiku 5.5 requests crossed the line. The cold-cache warning (`guard.cold`)
+does apply the higher tier to its figure; see [context.md](context.md).
+
 The burn report reads each transcript on its own: a rewound or forked copy of a session in a
 second file repeats its message ids and is counted again. [`puffr-swarm`](swarm.md) counts every
 id once across all files and machines; use it when that matters.

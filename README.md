@@ -7,10 +7,11 @@
 <img src="assets/puffr-flat.png" alt="" width="78" align="right">
 
 **Harness chrome for Claude Code.**
+PUFFR: Personal Usage, Fuel & Fleet Radar.
 Simple as Grokbot. Powerful as Hermes. Meme as OpenClaw. The *abunai* fish:
 prepared wrong, it kills. So PUFFR watches your gauges, and it inflates as your context fills.
 
-Puffr is Japanese for pufferfish, and abunai means dangerous, which is the point: a session
+The fish is a pufferfish (*fugu* in Japanese), and abunai means dangerous, which is the point: a session
 left alone burns money quietly, so this one sits in your statusline, counts every token you
 spend, and tells you which habit cost what, with the receipts to back it.
 
