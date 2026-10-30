@@ -1140,6 +1140,26 @@ cp lib/puffr.js "$TG/plug/lib/puffr.js"
 out=$(gp $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "repaired lib: same cold period still warns" || bad "repaired lib: same cold period still warns (got: $out)"
 out=$(gp $S); chk "after the warning went out: silent again" "$out" ""
 
+# Remembering the warning is best effort. A rename that fails leaves no tmp file behind, and a state
+# write that fails still delivers the warning (the once-per-period memory is lost, so it may repeat).
+printf 'guard.cold=on\n' > "$GCFG"
+S=grnmf-0040; cold1h > "$TG/$S.jsonl"
+mkdir -p "$TG/.puffr/guard/$S.json"; : > "$TG/.puffr/guard/$S.json/keep"   # a non-empty directory where the state file goes: rename fails
+out=$(gh $S); rc=$?
+chk "rename fails: exit 0" "$rc" "0"
+chk "rename fails: no tmp file left in the guard dir" "$(find "$TG/.puffr/guard" -name '*.tmp' | wc -l | tr -d ' ')" "0"
+echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "rename fails: warning still delivered" || bad "rename fails: warning still delivered (got: $out)"
+rm -rf "$TG/.puffr/guard/$S.json"
+
+S=gwrfl-0041; cold1h > "$TG/$S.jsonl"
+mv "$TG/.puffr/guard" "$TG/.puffr/guard.saved"; printf 'x' > "$TG/.puffr/guard"   # a file where the guard dir goes: mkdir and write fail
+out=$(gh $S); rc=$?
+chk "state write fails: exit 0" "$rc" "0"
+chk "state write fails: stdout is one JSON object with only systemMessage" "$(echo "$out" | jq -c 'keys' 2>/dev/null)" '["systemMessage"]'
+msg=$(echo "$out" | jq -r '.systemMessage // ""' 2>/dev/null)
+case "$msg" in "puffr: cache cold"*) ok "state write fails: warning text delivered";; *) bad "state write fails: warning text delivered (got: $msg)";; esac
+rm -f "$TG/.puffr/guard"; mv "$TG/.puffr/guard.saved" "$TG/.puffr/guard"
+
 # Haiku 5.5 over 100k pays 5x on every rate; the guard only fires above 100k, so the figure is the 5x tier.
 S=ghaik-0031; { arow 4000 claude-haiku-5-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
 out=$(gh $S); msg=$(echo "$out" | jq -r '.systemMessage // ""')

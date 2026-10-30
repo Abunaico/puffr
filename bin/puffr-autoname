@@ -139,10 +139,16 @@ function coldWarning(ev) {
     cost = ` about $${full.toFixed(2)} (list price, ${modelName(a.model)}, ${tierName})`;
   }
   const text = `puffr: cache cold on this ${Math.round(ctx / 1000)}k session; next turn rewrites it${cost || ` (${tierName} cache)`}. Consider /compact or /clear.`;
-  fs.mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 });
+  // Remembering the warning is best effort: if the write fails the once-per-period memory is lost for
+  // this prompt and the warning may repeat, which beats never warning. A failed rename leaves no tmp file.
   const tmp = `${stateFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ warnedFor: a.at }), { mode: 0o600 });
-  fs.renameSync(tmp, stateFile);
+  try {
+    fs.mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, JSON.stringify({ warnedFor: a.at }), { mode: 0o600 });
+    fs.renameSync(tmp, stateFile);
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+  }
   return text;
 }
 
