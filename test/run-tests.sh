@@ -743,6 +743,42 @@ chk "priced models list no unpriced entry" "$(cvd d0000005-0000-0000-0000-000000
 cvd d0000005-0000-0000-0000-000000000005 | grep -q 'unpriced' && bad "no unpriced note when every model is priced" || ok "no unpriced note when every model is priced"
 rm -rf "$TD"
 
+echo "— HUD nudge colour follows the cache tier; puffr-help commit stamp —"
+# The nudge turns yellow in the last quarter of the cache lifetime, the same rule as the cache timer:
+# 5m under 75s, 1h under 900s. An expired cache stays yellow. No cache data stays dim.
+TN=$(mktemp -d)
+nudge_col() { # TTL SECONDS_LEFT -> yellow | dim | none
+  local exp=$(( $(date +%s) + $2 )) raw
+  raw=$(jq -nc --argjson e "$exp" --arg t "$1" '{workspace:{current_dir:"/tmp"},context_window:{used_tokens:400000,context_window_size:1000000},prompt_cache:{expires_at:$e,ttl:$t}}' | HOME=$TN ./statusline.sh)
+  case "$raw" in *$'\033[33m/compact before a break'*) echo yellow;; *$'\033[2m/compact before a break'*) echo dim;; *) echo none;; esac
+}
+chk "nudge 5m, 200s left: not yellow" "$(nudge_col 5m 200)" "dim"
+chk "nudge 5m, 100s left (old 600s edge would say yellow): not yellow" "$(nudge_col 5m 100)" "dim"
+chk "nudge 5m, 60s left: yellow" "$(nudge_col 5m 60)" "yellow"
+chk "nudge 1h, 1000s left: not yellow" "$(nudge_col 1h 1000)" "dim"
+chk "nudge 1h, 700s left (between the old 600 and new 900): yellow" "$(nudge_col 1h 700)" "yellow"
+chk "nudge 1h, 500s left: yellow" "$(nudge_col 1h 500)" "yellow"
+chk "nudge, expired cache keeps yellow" "$(nudge_col 5m -30)" "yellow"
+chk "nudge, no cache data stays dim" "$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_tokens":400000,"context_window_size":1000000}}' | HOME=$TN ./statusline.sh | grep -c $'\033\\[2m/compact before a break')" "1"
+rm -rf "$TN"
+
+# puffr-help stamps the header with the commit, since every copy of a release carries the same version.
+TH=$(mktemp -d); mkdir -p "$TH/co" "$TH/plain" "$TH/under/sub" "$TH/home/.claude/plugins"
+cp -R bin lib .claude-plugin "$TH/co/"; cp -R bin lib .claude-plugin "$TH/plain/"; cp -R bin lib .claude-plugin "$TH/under/sub/"
+git -C "$TH/co" init -q && git -C "$TH/co" add -A && git -C "$TH/co" -c user.name=t -c user.email=t@t commit -qm stamp
+git -C "$TH/under" init -q
+hlp() { HOME=$TH/home CLAUDE_CONFIG_DIR= node "$1/bin/puffr-help" --plain | grep -m1 '^PUFFR'; }
+SHA=$(git -C "$TH/co" rev-parse --short HEAD)
+chk "help from a git checkout shows its short commit" "$(hlp "$TH/co")" "PUFFR v$(jq -r .version .claude-plugin/plugin.json)  commit $SHA  Fu the Bloat. Cool the Burn."
+printf '{"version":2,"plugins":{"puffr@puffr-tools":[{"scope":"user","installPath":"%s","version":"0","gitCommitSha":"819cb61968f2b1f9602d70ddd8f9c8bb60688418"}]}}' "$TH/plain" > "$TH/home/.claude/plugins/installed_plugins.json"
+case "$(hlp "$TH/plain")" in *"commit 819cb61 (install record)"*) ok "help from a copy without .git reads the install record";; *) bad "help from a copy without .git reads the install record (got: $(hlp "$TH/plain"))";; esac
+mkdir -p "$TH/cfg/plugins"; cp "$TH/home/.claude/plugins/installed_plugins.json" "$TH/cfg/plugins/"; rm "$TH/home/.claude/plugins/installed_plugins.json"
+case "$(HOME=$TH/home CLAUDE_CONFIG_DIR=$TH/cfg node "$TH/plain/bin/puffr-help" --plain | grep -m1 '^PUFFR')" in *"commit 819cb61 (install record)"*) ok "help honours CLAUDE_CONFIG_DIR for the install record";; *) bad "help honours CLAUDE_CONFIG_DIR for the install record";; esac
+case "$(hlp "$TH/plain")" in *"commit unknown"*) ok "help from a copy with no record says commit unknown";; *) bad "help from a copy with no record says commit unknown (got: $(hlp "$TH/plain"))";; esac
+case "$(hlp "$TH/under/sub")" in *"commit unknown"*) ok "help from a copy inside an unrelated repo does not borrow that repo's commit";; *) bad "help from a copy inside an unrelated repo does not borrow that repo's commit (got: $(hlp "$TH/under/sub"))";; esac
+chk "versions stay 0.10.0 in all four fields" "$(jq -r '.version' package.json .claude-plugin/plugin.json; jq -r '.. | .version? // empty' .claude-plugin/marketplace.json)" "$(printf '0.10.0\n0.10.0\n0.10.0\n0.10.0')"
+rm -rf "$TH"
+
 echo "— swarm: roots, rewind dedupe, lanes, messages, phases, bill —"
 TS=$(mktemp -d); R1="$TS/m1/.claude/projects/-p"; R2="$TS/m2/.claude/projects/-p"; mkdir -p "$R1" "$R2"
 OP=claude-opus-5; SN=claude-sonnet-5

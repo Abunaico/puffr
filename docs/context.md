@@ -64,9 +64,8 @@ CACHE
 - **Cache break causes** are inferred: idle past the cache TTL (5 minutes or 1 hour), a
   compaction, a model switch, or a changed prefix (tools, MCP servers, or system prompt changed
   mid-session). The first request of a session shows as `cold start`.
-- **"Input billed at X% of uncached"** applies the standard cache multipliers (read 0.1×,
-  5-minute write 1.25×, 1-hour write 2×) to your actual token mix. It is model-agnostic; no price
-  table is involved.
+- **"Input billed at X% of uncached"** applies the standard cache multipliers (reads at each model's real
+  read rate, 0.1× only for unpriced models; 5-minute write 1.25×, 1-hour write 2×) to your actual token mix.
 - **Window size** is recorded by the HUD on each render, since transcripts don't carry it.
   Without the HUD it is assumed: 200k, or 1M if the session ever went past 200k. Override with
   `--window`.

@@ -6,6 +6,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const F = require('../lib/puffr.js');
 
 const PLAIN = process.argv.includes('--plain');
@@ -16,6 +17,28 @@ const COLOR = !PLAIN && !process.env.NO_COLOR && (process.stdout.isTTY || proces
   || !!process.env.FORCE_COLOR || (process.env.CLAUDECODE === '1' && TRUECOLOR));
 const C = (c, s) => COLOR ? `\x1b[${c}m${s}\x1b[0m` : s;
 const version = (F.readJson(path.join(F.PUFFR_ROOT, '.claude-plugin', 'plugin.json'), {}) || {}).version || '?';
+
+// Every copy of a release carries the same version string, so the header also names the commit.
+// A checkout (.git is a directory, or a file in a worktree) is asked directly, but only when PUFFR_ROOT
+// is itself the top level, so a copy inside an unrelated repo is not credited with that repo's commit.
+// A plugin-cache copy has no .git; Claude Code records its commit in installed_plugins.json.
+const commit = (() => {
+  const root = F.PUFFR_ROOT;
+  if (fs.existsSync(path.join(root, '.git'))) {
+    const r = spawnSync('git', ['-C', root, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 5000 });
+    const sha = (r.stdout || '').trim();
+    if (r.status === 0 && /^[0-9a-f]{4,40}$/.test(sha)) return sha;
+  }
+  const real = p => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+  const me = real(root);
+  const reg = F.readJson(path.join(process.env.CLAUDE_CONFIG_DIR || path.join(F.HOME, '.claude'), 'plugins', 'installed_plugins.json'), {}) || {};
+  for (const list of Object.values(reg.plugins || {})) {
+    for (const i of Array.isArray(list) ? list : []) {
+      if (i && typeof i.installPath === 'string' && /^[0-9a-f]{7,40}$/.test(i.gitCommitSha || '') && real(i.installPath) === me) return `${i.gitCommitSha.slice(0, 7)} (install record)`;
+    }
+  }
+  return 'unknown';
+})();
 
 const COMMANDS = [
   ['/puffr:hud', 'Check the HUD statusline; install, repair, remove'],
@@ -45,7 +68,7 @@ if (COLOR) {
   const art = process.argv.includes('--puff') ? 'puffr-puff.ans' : 'puffr-flat.ans';
   try { out.push(fs.readFileSync(path.join(F.PUFFR_ROOT, 'assets', art), 'utf8').replace(/\n$/, '')); } catch {}
 }
-out.push(`${C('1;33', 'PUFFR')} ${C('2', `v${version}`)}  ${C('3', 'Fu the Bloat. Cool the Burn.')}`);
+out.push(`${C('1;33', 'PUFFR')} ${C('2', `v${version}`)}  ${C('2', `commit ${commit}`)}  ${C('3', 'Fu the Bloat. Cool the Burn.')}`);
 out.push(C('2', 'context, cost & fleet HUD for Claude Code and Codex · github.com/Abunaico/puffr · free + attribution'));
 out.push('');
 const w = Math.max(...COMMANDS.map(c => c[0].length));

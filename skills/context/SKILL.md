@@ -21,6 +21,6 @@ Arguments the user passed: "$ARGUMENTS"
 - Present the output as-is. Then add at most three observations, grounded in the numbers:
   - Largest composition rows and largest items: what could be trimmed (big tool results, re-read files, noisy hooks).
   - Cache breaks: `TTL expired` means the session sat idle past the cache lifetime; `prefix changed` usually means tools/MCP servers/system prompt changed mid-session.
-  - "input billed at X% of uncached" is the input-price multiplier after cache discounts (read 0.1×, 5m write 1.25×, 1h write 2×).
+  - "input billed at X% of uncached" is the input-price multiplier after cache discounts (reads at each model's real read rate, 0.1× only for unpriced models; 5m write 1.25×, 1h write 2×).
 - `≈` rows are estimates (char count scaled to the measured total). Usage numbers, hit rate, and breaks are measured from the API usage the transcript records.
 - For machine-readable work use `--json`.

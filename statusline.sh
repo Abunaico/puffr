@@ -389,7 +389,7 @@ mode=""; mode_short=""; eff=""; sty=""
 # expires; compacting before a break makes that rewrite small.
 nudge=""; nudge_short=""
 if feat hud.nudge && [ "$used" -ge 150000 ]; then
-  nc="$DIM"; [ -n "$cache_left" ] && [ "$cache_left" -lt 600 ] && nc="$YLW"
+  nc="$DIM"; [ -n "$cache_left" ] && [ "$cache_left" -lt $(( cache_tier / 4 )) ] && nc="$YLW"
   nudge="${nc}/compact before a break${RST}"; nudge_short="${nc}/compact?${RST}"
 fi
 wd nudge 8 "$nudge" "$nudge_short"
@@ -572,11 +572,3 @@ for (( li = 0; li < ${#L_LBL[@]}; li++ )); do layout_line "${L_LBL[li]}" "${L_IT
 [ -n "$layout_note" ] && printf '%s\n' "${YLW}🐡 ${layout_note}${RST}"
 # Claude Code hides the HUD on a non-zero exit, and the test above leaves 1 behind.
 exit 0
-# A big context rewrites at the cache-write price on a return after the cache
-# expires; compacting before a break makes that rewrite small.
-nudge=""; nudge_short=""
-if feat hud.nudge && [ "$used" -ge 150000 ]; then
-  nc="$DIM"; [ -n "$cache_left" ] && [ "$cache_left" -lt 600 ] && nc="$YLW"
-  nudge="${nc}/compact before a break${RST}"; nudge_short="${nc}/compact?${RST}"
-fi
-wd nudge 8 "$nudge" "$nudge_short"
