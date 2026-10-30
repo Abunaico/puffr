@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="PUFFR: context, cost &amp; fleet HUD for Claude Code, a pixel pufferfish on a blue arcade screen" width="720">
+  <img src="assets/banner.png" alt="PUFFR: personal usage, fuel &amp; fleet radar, a pixel pufferfish on a blue arcade screen" width="720">
 </p>
 
 # PUFFR: context, cost & fleet HUD for Claude Code
