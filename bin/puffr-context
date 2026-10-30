@@ -12,6 +12,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { price } = require('../lib/puffr.js');
 
 const args = process.argv.slice(2);
 const flag = (n, d) => { const i = args.indexOf(n); return i >= 0 && i + 1 < args.length ? args[i + 1] : d; };
@@ -217,10 +218,20 @@ function analyze(S) {
   const sum = k => turns.reduce((a, t) => a + t[k], 0);
   const tot = { input: sum('input'), read: sum('read'), w5: sum('w5'), w1h: sum('w1h'), output: sum('output') };
   const allIn = tot.input + tot.read + tot.w5 + tot.w1h;
-  // Input-price multipliers: read 0.1×, 5m write 1.25×, 1h write 2×, uncached 1×.
-  const weighted = tot.read * 0.1 + tot.w5 * 1.25 + tot.w1h * 2 + tot.input;
+  // Input-price multipliers: 5m write 1.25×, 1h write 2×, uncached 1×; the read multiplier is the
+  // model's own cache-read price over its input price (0.05× Opus 5.5 and Sonnet 5.5, 0.025× Fable 5.1,
+  // 0.1× most others), applied turn by turn so a mixed-model session is weighted per model. A model
+  // with no price keeps 0.1× and is listed in unpricedModels.
+  const unpriced = new Set();
+  const readMult = model => {
+    const p = price(model || '');
+    if (p && p.i > 0) return p.r / p.i;
+    unpriced.add(model || '?');
+    return 0.1;
+  };
+  const weighted = turns.reduce((a, t) => a + t.read * readMult(t.model) + t.w5 * 1.25 + t.w1h * 2 + t.input, 0);
   const cache = {
-    requests: turns.length, ...tot,
+    requests: turns.length, ...tot, unpricedModels: [...unpriced],
     hitRate: allIn ? tot.read / allIn : 0,
     costVsUncached: allIn ? weighted / allIn : 0,
     breaks,
@@ -328,6 +339,7 @@ out.push(bold('CACHE'));
 const hitCol = ca.hitRate >= 0.8 ? '32' : ca.hitRate >= 0.5 ? '33' : '31';
 out.push(`  hit rate ${C(hitCol, bold(pct(ca.hitRate)))} over ${ca.requests} requests · input billed at ${bold(pct(ca.costVsUncached))} of uncached`);
 out.push(`  read ${k(ca.read)} · write ${k(ca.w5 + ca.w1h)} ${dim(`(5m ${k(ca.w5)} / 1h ${k(ca.w1h)})`)} · uncached ${k(ca.input)} · output ${k(ca.output)}`);
+if (ca.unpricedModels.length) out.push(dim(`  read assumed 0.1× for unpriced: ${ca.unpricedModels.map(clean).join(', ')}`));
 if (ca.breaks.length) {
   out.push('');
   out.push(bold(`  cache breaks (${ca.breaks.length})`));

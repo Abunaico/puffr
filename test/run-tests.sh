@@ -695,6 +695,54 @@ chk "sonnet-5-5 / sonnet-5 / opus-5-5 / opus-5 cache-read price" "$(node -e "con
 chk "dated sonnet-5-5 id takes the same row" "$(node -e "const F=require('./lib/puffr.js'); console.log(F.costOf('claude-sonnet-5-5-20261001',[0,1e6,0,0,0]).toFixed(2))")" "0.10"
 chk "sonnet-5-5 input and output unchanged" "$(node -e "const F=require('./lib/puffr.js'); console.log(F.costOf('claude-sonnet-5-5',[1e6,0,0,0,1e6]))")" "12"
 
+echo "— prices: Haiku 5.5 (lower tier) and puffr-context read rate —"
+# Haiku 5.5 list prices up to 100k prompt tokens, $/MTok: input 0.10, 5m write 0.125, 1h write 0.20,
+# cache read 0.01, output 0.50. 1M tokens of one kind each, so the cost reads as the rate.
+hk() { node -e "const F=require('./lib/puffr.js'); const u=[0,0,0,0,0]; u[$1]=1e6; console.log(F.costOf('$2',u).toFixed(3))"; }
+chk "haiku-5-5 input 0.10" "$(hk 0 claude-haiku-5-5)" "0.100"
+chk "haiku-5-5 cache read 0.01" "$(hk 1 claude-haiku-5-5)" "0.010"
+chk "haiku-5-5 5m write 0.125" "$(hk 2 claude-haiku-5-5)" "0.125"
+chk "haiku-5-5 1h write 0.20" "$(hk 3 claude-haiku-5-5)" "0.200"
+chk "haiku-5-5 output 0.50" "$(hk 4 claude-haiku-5-5)" "0.500"
+chk "dated haiku-5-5 id takes the same row" "$(hk 0 claude-haiku-5-5-20261001)" "0.100"
+chk "haiku-5-5 is a listed price" "$(node -e "const F=require('./lib/puffr.js'); console.log(F.price('claude-haiku-5-5').listed)")" "true"
+chk "haiku-5-5 rewrite premium (5m 0.115, 1h 0.19)" "$(node -e "const F=require('./lib/puffr.js'); console.log(F.rewriteCost('claude-haiku-5-5',1e6,0).toFixed(3), F.rewriteCost('claude-haiku-5-5',0,1e6).toFixed(3))")" "0.115 0.190"
+chk "haiku-4-5 input unchanged" "$(hk 0 claude-haiku-4-5)" "1.000"
+chk "other haiku ids keep the estimated 1/5/0.1 fallback" "$(node -e "const F=require('./lib/puffr.js'); const p=F.price('claude-haiku-9'); console.log([p.i,p.o,p.r,p.listed].join(' '))")" "1 5 0.1 false"
+# KNOWN LIMIT: a request whose prompt (input + cache read + both writes) is over 100k pays 5x on every
+# rate. Day buckets keep no per-request prompt length, so costOf prices every Haiku 5.5 request at the
+# lower tier; fixing it needs a state shape change and a cache version bump.
+chk "haiku-5-5 LIMIT: 150k-token prompt priced at the lower tier (over-100k 5x not applied)" "$(node -e "const F=require('./lib/puffr.js'); console.log(F.costOf('claude-haiku-5-5',[150000,0,0,0,0]).toFixed(4))")" "0.0150"
+
+# puffr-context weights cache reads by the model that made each turn: Opus 5.5 and Sonnet 5.5 read at
+# 0.05x input, Fable 5.1 at 0.025x, other priced models at 0.1x; an unpriced model keeps 0.1x and is named.
+TD=$(mktemp -d); mkdir -p "$TD/.claude/projects/-tmp-rd" "$TD/cache"
+cvd() { HOME=$TD XDG_CACHE_HOME=$TD/cache CLAUDE_CONFIG_DIR= CLAUDE_CODE_SESSION_ID= node bin/puffr-context "$@"; }
+# rdt FILE ID MINUTE MODEL INPUT READ W5 W1H: one assistant turn (write total = W5 + W1H)
+rdt() { printf '{"type":"assistant","timestamp":"2026-09-17T10:0%s:00Z","message":{"id":"%s","model":"%s","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":%s,"ephemeral_1h_input_tokens":%s}},"content":[]}}\n' "$3" "$2" "$4" "$5" "$6" "$(($7 + $8))" "$7" "$8" >> "$1"; }
+RD="$TD/.claude/projects/-tmp-rd"
+ratio() { cvd "$1" --json | jq -r '.cache.costVsUncached * 10000 | round'; }
+rdt "$RD/d0000001-0000-0000-0000-000000000001.jsonl" a1 1 claude-opus-5-5 0 1000000 0 0
+rdt "$RD/d0000002-0000-0000-0000-000000000002.jsonl" b1 1 claude-sonnet-5-5 0 1000000 0 0
+rdt "$RD/d0000003-0000-0000-0000-000000000003.jsonl" c1 1 claude-opus-5 0 1000000 0 0
+rdt "$RD/d0000004-0000-0000-0000-000000000004.jsonl" d1 1 claude-fable-5-1 0 1000000 0 0
+rdt "$RD/d0000005-0000-0000-0000-000000000005.jsonl" e1 1 claude-opus-5-5 0 1000000 0 0
+rdt "$RD/d0000005-0000-0000-0000-000000000005.jsonl" e2 2 claude-opus-5 0 1000000 0 0
+rdt "$RD/d0000006-0000-0000-0000-000000000006.jsonl" f1 1 gpt-test-unpriced 0 1000000 0 0
+rdt "$RD/d0000007-0000-0000-0000-000000000007.jsonl" g1 1 claude-opus-5-5 1000000 1000000 1000000 1000000
+chk "opus-5-5 reads at 0.05x" "$(ratio d0000001-0000-0000-0000-000000000001)" "500"
+chk "sonnet-5-5 reads at 0.05x" "$(ratio d0000002-0000-0000-0000-000000000002)" "500"
+chk "opus-5 (a 0.1x model) reads at 0.1x" "$(ratio d0000003-0000-0000-0000-000000000003)" "1000"
+chk "fable-5-1 reads at 0.025x" "$(ratio d0000004-0000-0000-0000-000000000004)" "250"
+chk "mixed session weights each turn by its own model (0.05x and 0.1x → 0.075)" "$(ratio d0000005-0000-0000-0000-000000000005)" "750"
+chk "writes and uncached input keep 1.25x, 2x, 1x on opus-5-5" "$(ratio d0000007-0000-0000-0000-000000000007)" "10750"
+chk "unpriced model keeps the 0.1x assumption" "$(ratio d0000006-0000-0000-0000-000000000006)" "1000"
+chk "unpriced model is named in --json" "$(cvd d0000006-0000-0000-0000-000000000006 --json | jq -r '.cache.unpricedModels | join(",")')" "gpt-test-unpriced"
+cvd d0000006-0000-0000-0000-000000000006 | grep -q 'assumed 0.1× for unpriced: gpt-test-unpriced' && ok "unpriced assumption stated in the report" || bad "unpriced assumption stated in the report"
+chk "priced models list no unpriced entry" "$(cvd d0000005-0000-0000-0000-000000000005 --json | jq -r '.cache.unpricedModels | length')" "0"
+cvd d0000005-0000-0000-0000-000000000005 | grep -q 'unpriced' && bad "no unpriced note when every model is priced" || ok "no unpriced note when every model is priced"
+rm -rf "$TD"
+
 echo "— swarm: roots, rewind dedupe, lanes, messages, phases, bill —"
 TS=$(mktemp -d); R1="$TS/m1/.claude/projects/-p"; R2="$TS/m2/.claude/projects/-p"; mkdir -p "$R1" "$R2"
 OP=claude-opus-5; SN=claude-sonnet-5
