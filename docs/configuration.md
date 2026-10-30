@@ -44,9 +44,17 @@ Haiku the first time; with `off`, it offers again on about one run in ten; with 
 offers. `puffr-config haiku-check` prints that decision (`on`, `ask`, or `skip`) for skills to use. `reset` leaves it alone, so
 "never" stays never. Autoname has its own switch (`autoname`, above).
 
+## guard.cold
+
+Opt-in, `off` by default: `puffr-config set guard.cold on`. When the prompt cache has gone cold on a
+context over 100k tokens, the next prompt shows one warning with the estimated rewrite cost at list
+price, then stays quiet until the next cold period. It never blocks a prompt and makes no model call.
+It reads the last 256 KiB of the transcript only while on, skips a session that was just compacted,
+and says nothing when the transcript is missing or unreadable. `on all` and `reset` leave it alone.
+
 ## The off switch
 
-`/puffr:off` creates `~/.puffr/disabled`. The HUD, fleet rows, banner, autoname, and watch check
+`/puffr:off` creates `~/.puffr/disabled`. The HUD, fleet rows, banner, autoname, cold-cache guard, and watch check
 for it on every run and go silent. A running `puffr-watch` goes quiet within one poll. `/puffr:on`
 removes it. Nothing is uninstalled.
 

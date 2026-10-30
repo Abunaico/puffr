@@ -1014,6 +1014,127 @@ cfg off hud.nudge >/dev/null
 echo "${NJ/USED/400000}" | HOME=$TB ./statusline.sh | strip_ansi | grep -q 'compact' && bad "nudge switch off" || ok "nudge switch off"
 rm -rf "$TB"
 
+echo "— cold-return guard: config —"
+CT=$SANDBOX/guardcfg; mkdir -p "$CT"
+gc() { HOME=$CT node bin/puffr-config "$@"; }
+chk "guard.cold unset → off" "$(gc get guard.cold)" "off"
+gc on all >/dev/null; chk "on all does not enable guard.cold" "$(gc get guard.cold)" "off"
+gc reset >/dev/null; chk "reset does not enable guard.cold" "$(gc get guard.cold)" "off"
+gc set guard.cold on >/dev/null; chk "set guard.cold on" "$(gc get guard.cold)" "on"
+gc reset >/dev/null; chk "reset leaves guard.cold alone" "$(gc get guard.cold)" "on"
+gc off hud.git >/dev/null; chk "feature toggles keep guard.cold" "$(gc get guard.cold)" "on"
+gc set guard.cold maybe >/dev/null 2>&1; chk "guard.cold bad value refused" "$?" "2"
+gc set guard.cold off >/dev/null; chk "set guard.cold off" "$(gc get guard.cold)" "off"
+grep -q '^guard\.cold=' "$CT/.puffr/config" && bad "off leaves no guard line in the config" || ok "off leaves no guard line in the config"
+chk "hooks.json: one UserPromptSubmit command (guard rides the autoname hook)" "$(jq '[.hooks.UserPromptSubmit[].hooks[]] | length' hooks/hooks.json)" "1"
+
+echo "— cold-return guard: hook —"
+TG=$SANDBOX/guard; mkdir -p "$TG/.puffr/autoname"
+iso() { node -e 'console.log(new Date(Date.now()-process.argv[1]*1000).toISOString())' "$1"; }
+# arow <age-secs> <model> <input> <cache-read> <write-5m> <write-1h>: one assistant row
+arow() { printf '{"type":"assistant","timestamp":"%s","message":{"model":"%s","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s,"cache_creation":{"ephemeral_5m_input_tokens":%s,"ephemeral_1h_input_tokens":%s}}}}\n' "$(iso "$1")" "$2" "$3" "$4" "$(($5+$6))" "$5" "$6"; }
+urow() { printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":"next"}}\n' "$(iso 0)"; }
+brow() { printf '{"type":"system","subtype":"compact_boundary","timestamp":"%s","compactMetadata":{"trigger":"manual","preTokens":400000}}\n' "$(iso "$1")"; }
+gev() { printf '{"session_id":"%s","transcript_path":"%s","cwd":"/tmp","prompt":"hello there","hook_event_name":"UserPromptSubmit"}' "$1" "$2"; }
+gh() { gev "$1" "$TG/$1.jsonl" | HOME=$TG node bin/puffr-autoname hook; }
+# 400,000 tokens of context (10 + 398,990 read + 1,000 written on the 1h tier), 4,000s old: cold by 400s.
+cold1h() { arow 4000 claude-opus-5-5 10 398990 0 1000; urow; }
+GCFG="$TG/.puffr/config"
+
+rm -f "$GCFG"
+S=gdflt-0001; cold1h > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?
+chk "guard off by default: silent on a cold transcript, exit 0" "$rc:$out" "0:"
+[ -e "$TG/.puffr/guard/$S.json" ] && bad "guard off writes no state" || ok "guard off writes no state"
+
+printf 'guard.cold=on\n' > "$GCFG"
+S=gcold-0002; cold1h > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?
+chk "on + cold over threshold: exit 0" "$rc" "0"
+chk "warning is one JSON object with only systemMessage (no block, no additionalContext)" "$(echo "$out" | jq -c 'keys')" '["systemMessage"]'
+msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'400k'*'$3.20 (list price, Opus 5.5, 1h)'*'/compact'*) ok "warning carries size, dollar figure labelled list price, model, tier";; *) bad "warning text (got: $msg)";; esac
+
+S=gcold-0003; { arow 4000 gpt-9-unknown 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'$'*|'') bad "unpriced model: warns without a dollar figure (got: $msg)";; *cold*) ok "unpriced model: warns without a dollar figure";; *) bad "unpriced model (got: $msg)";; esac
+
+S=gwarm-0004; { arow 60 claude-opus-5-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "on + warm: silent, exit 0" "$rc:$out" "0:"
+
+S=gsmal-0005; { arow 4000 claude-opus-5-5 10 48990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "on + cold below threshold: silent, exit 0" "$rc:$out" "0:"
+S=gedge-0006; { arow 4000 claude-opus-5-5 0 99000 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "on + exactly 100000 tokens: silent (must exceed)" "$rc:$out" "0:"
+
+S=gfive-0007; { arow 400 claude-opus-5-5 10 398990 1000 0; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); msg=$(echo "$out" | jq -r '.systemMessage // ""')
+case "$msg" in *'$2.00 (list price, Opus 5.5, 5m)'*) ok "5m tier: cold after 300s, priced at the 5m write rate";; *) bad "5m tier (got: $msg)";; esac
+
+S=gcomp-0008; { arow 4000 claude-opus-5-5 10 398990 0 1000; brow 10; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "compaction after the last assistant entry: silent" "$rc:$out" "0:"
+S=gcomp-0009; { brow 5000; arow 4000 claude-opus-5-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "compaction before the last assistant entry: still warns" || bad "compaction before the last assistant entry: still warns"
+
+S=gonce-0010; cold1h > "$TG/$S.jsonl"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "first prompt of a cold period warns" || bad "first prompt of a cold period warns"
+out=$(gh $S); rc=$?; chk "second prompt, same cold period: silent" "$rc:$out" "0:"
+arow 3900 claude-opus-5-5 10 398990 0 1000 >> "$TG/$S.jsonl"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "a new cold period warns again" || bad "a new cold period warns again"
+
+printf 'guard.cold=on\nautoname=off\n' > "$GCFG"
+S=gnoan-0011; cold1h > "$TG/$S.jsonl"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "on with autoname off: warns" || bad "on with autoname off: warns"
+printf 'guard.cold=on\n' > "$GCFG"
+S=gdone-0012; cold1h > "$TG/$S.jsonl"
+printf '{"prompts":[],"generated":[],"applied":null,"appliedFrom":0,"calls":9,"done":true}' > "$TG/.puffr/autoname/$S.json"
+out=$(gh $S); echo "$out" | jq -e '.systemMessage' >/dev/null 2>&1 && ok "on with autoname done: still warns" || bad "on with autoname done: still warns"
+touch "$TG/.puffr/disabled"
+S=gmute-0013; cold1h > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "/puffr:off mutes the guard too" "$rc:$out" "0:"
+rm -f "$TG/.puffr/disabled"
+
+S=gbad1-0014; printf 'not json\n{"type":"assistant","timestamp":"2026\n\x01\x02 garbage\n' > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "malformed transcript: silent, exit 0" "$rc:$out" "0:"
+S=gbad2-0015; { printf '{"type":"assistant","timestamp":"not a date","message":{"model":"claude-opus-5-5","usage":{"input_tokens":"x","cache_creation_input_tokens":5}}}\n'; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "unusable timestamp and usage: silent, exit 0" "$rc:$out" "0:"
+out=$(gev gmiss-0016 "$TG/does-not-exist.jsonl" | HOME=$TG node bin/puffr-autoname hook); rc=$?; chk "missing transcript file: silent, exit 0" "$rc:$out" "0:"
+out=$(printf '{"session_id":"gnopath-0017","cwd":"/tmp","prompt":"x"}' | HOME=$TG node bin/puffr-autoname hook); rc=$?; chk "no transcript_path: silent, exit 0" "$rc:$out" "0:"
+out=$(printf 'not json' | HOME=$TG node bin/puffr-autoname hook); rc=$?; chk "malformed stdin: silent, exit 0" "$rc:$out" "0:"
+S=gtail-0018; { arow 4000 claude-opus-5-5 10 398990 0 1000; node -e 'const r=JSON.stringify({type:"user",timestamp:"2026-01-01T00:00:00Z",message:{role:"user",content:"x".repeat(1000)}})+"\n";process.stdout.write(r.repeat(400))'; } > "$TG/$S.jsonl"
+out=$(gh $S); rc=$?; chk "assistant row beyond the 256 KiB tail is not read: silent" "$rc:$out" "0:"
+
+S=gmerg-0019; cold1h > "$TG/$S.jsonl"
+printf '{"title":"ACO-GUARD-TEST","from":1}' > "$TG/.puffr/autoname/$S.pending"
+out=$(gh $S); rc=$?
+chk "title + warning: exit 0" "$rc" "0"
+chk "title + warning: stdout is one JSON document" "$(echo "$out" | jq -s 'length')" "1"
+chk "title + warning: sessionTitle intact" "$(echo "$out" | jq -c '.hookSpecificOutput|[.hookEventName,.sessionTitle]')" '["UserPromptSubmit","ACO-GUARD-TEST"]'
+chk "title + warning: systemMessage present" "$(echo "$out" | jq -r '.systemMessage|startswith("puffr: cache cold")')" "true"
+rm -f "$GCFG"
+S=gtitl-0020; cold1h > "$TG/$S.jsonl"
+printf '{"title":"ACO-TITLE-ONLY","from":1}' > "$TG/.puffr/autoname/$S.pending"
+out=$(gh $S)
+chk "guard off: title output byte-identical to before" "$out" '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","sessionTitle":"ACO-TITLE-ONLY"}}'
+
+# Reads: count .jsonl opens and lib/puffr.js loads through a preload.
+cat > "$TG/count.js" <<'EOF'
+const fs = require('fs'), M = require('module');
+const open = fs.openSync, load = M._load; let n = 0, lib = 0;
+fs.openSync = function (p, ...a) { if (String(p).endsWith('.jsonl')) n++; return open.call(this, p, ...a); };
+M._load = function (r, ...a) { if (/lib\/puffr(\.js)?$/.test(String(r))) lib++; return load.call(this, r, ...a); };
+process.on('exit', () => fs.appendFileSync(process.env.COUNT_FILE, `${n} ${lib}\n`));
+EOF
+cnt() { COUNT_FILE="$TG/count.out" NODE_OPTIONS="--require $TG/count.js" gh "$1" >/dev/null; tail -1 "$TG/count.out"; }
+S=gcnt-0021; cold1h > "$TG/$S.jsonl"
+chk "guard off: one transcript open (autoname's own), lib not loaded" "$(cnt $S)" "1 0"
+printf 'guard.cold=on\n' > "$GCFG"
+S=gcnt-0022; { arow 60 claude-opus-5-5 10 398990 0 1000; urow; } > "$TG/$S.jsonl"
+chk "guard on + warm: one extra transcript read, lib not loaded" "$(cnt $S)" "2 0"
+S=gcnt-0023; cold1h > "$TG/$S.jsonl"
+chk "guard on + cold: one extra transcript read, lib loaded once" "$(cnt $S)" "2 1"
+rm -f "$GCFG"
+
 echo "— ucef panel —"
 # Contract fixtures, redaction vectors, every adapter, read-only guarantees, CLI exit codes.
 # The node script prints the same ✔/✘ lines as this file; fold them into the totals here.

@@ -10,6 +10,8 @@
 //        puffr-autoname generate <session-id>        (background worker)
 //        puffr-autoname suggest [--cwd <dir>] <prompt>...   print a name, apply nothing
 // Off switch: `autoname=off` in ~/.puffr/config, or /puffr:off.
+// The same hook also carries the opt-in cold-return guard (`guard.cold=on`, see coldWarning):
+// one node process per prompt, one JSON document on stdout, and neither half can break the other.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -26,11 +28,12 @@ const ID = /^[A-Za-z0-9-]{8,64}$/;
 
 const clean = s => String(s || '').replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 
-function isOff() {
-  if (fs.existsSync(path.join(DIR, 'disabled'))) return true;
-  try { return /^\s*autoname\s*=\s*off\s*$/m.test(fs.readFileSync(path.join(DIR, 'config'), 'utf8')); }
-  catch { return false; }
+function configHas(re) {
+  try { return re.test(fs.readFileSync(path.join(DIR, 'config'), 'utf8')); } catch { return false; }
 }
+const muted = () => fs.existsSync(path.join(DIR, 'disabled'));
+const isOff = () => muted() || configHas(/^\s*autoname\s*=\s*off\s*$/m);
+const guardOn = () => !muted() && configHas(/^\s*guard\.cold\s*=\s*on\s*$/m);
 
 function readJSON(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } }
 function writeJSON(f, v) {
@@ -63,20 +66,82 @@ function lastCustomTitle(file) {
   return null;
 }
 
-function hook() {
-  if (process.env.PUFFR_AUTONAME_CHILD || isOff()) return;
-  let ev; try { ev = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return; }
+// Cold-return guard. Warns once per cold period, never blocks, and costs nothing when off.
+const COLD_TOKENS = 100000;     // warn only when the context to rewrite is larger than this
+const TAIL_BYTES = 262144;      // transcript tail read, as statusline.sh does
+const GUARD_DIR = path.join(DIR, 'guard');
+
+// Last real assistant row in the tail, with the facts the warning needs. Null when anything is missing.
+function lastAssistant(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size, len = Math.min(size, TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    let compacted = false, last = null, tier = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const l = lines[i];
+      const isBoundary = l.includes('compact_boundary'), isAsst = /"type": ?"assistant"/.test(l);
+      if (!isBoundary && !isAsst) continue;
+      let e; try { e = JSON.parse(l); } catch { continue; }
+      if (!last && e.type === 'system' && e.subtype === 'compact_boundary') { compacted = true; continue; }
+      const m = e.type === 'assistant' && !e.isSidechain && e.message;
+      const u = m && m.usage;
+      if (!u || typeof m.model !== 'string' || m.model === '<synthetic>') continue;
+      if (!last) last = { model: m.model, at: e.timestamp, u };
+      if (tier === null && Number(u.cache_creation_input_tokens) > 0) {
+        tier = Number(u.cache_creation && u.cache_creation.ephemeral_1h_input_tokens) > 0 ? 3600 : 300;
+      }
+      if (last && tier !== null) break;
+    }
+    return last && tier !== null ? { ...last, tier, compacted } : null;
+  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+
+const modelName = m => { const x = /(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?!\d)/.exec(m); return x ? `${x[1][0].toUpperCase()}${x[1].slice(1)} ${x[2]}${x[3] ? '.' + x[3] : ''}` : clean(m).slice(0, 40); };
+
+// Returns the warning text, or null. A missing or odd field means null, never a guess.
+function coldWarning(ev) {
   const id = ev && ev.session_id;
-  if (!ID.test(String(id))) return;
+  if (!ID.test(String(id)) || typeof ev.transcript_path !== 'string' || !ev.transcript_path) return null;
+  const a = lastAssistant(ev.transcript_path);
+  if (!a || a.compacted) return null;
+  const at = Date.parse(a.at), n = k => Number(a.u[k]) || 0;
+  const ctx = n('input_tokens') + n('cache_read_input_tokens') + n('cache_creation_input_tokens');
+  if (!Number.isFinite(at) || !(ctx > COLD_TOKENS) || !(Date.now() > at + a.tier * 1000)) return null;
+  const stateFile = path.join(GUARD_DIR, `${id}.json`), prior = readJSON(stateFile);
+  if (prior && prior.warnedFor === a.at) return null;
+  fs.mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ warnedFor: a.at }), { mode: 0o600 });
+  fs.renameSync(tmp, stateFile);
+  // Loaded only now, so the off path and the warm path never pay for it.
+  const lib = require(path.join(__dirname, '..', 'lib', 'puffr.js'));
+  const p = lib.price(a.model);
+  let cost = '';
+  if (p) {
+    // rewriteCost is the extra over a warm read; add the read back for the full rewrite.
+    const full = lib.rewriteCost(a.model, a.tier === 300 ? ctx : 0, a.tier === 3600 ? ctx : 0) + ctx * p.r / 1e6;
+    cost = ` about $${full.toFixed(2)} (list price, ${modelName(a.model)}, ${a.tier === 3600 ? '1h' : '5m'})`;
+  }
+  return `puffr: cache cold on this ${Math.round(ctx / 1000)}k session; next turn rewrites it${cost || ` (${a.tier === 3600 ? '1h' : '5m'} cache)`}. Consider /compact or /clear.`;
+}
+
+// Autoname's half of the hook: returns the title to apply, or null.
+function autonameStep(ev) {
+  const id = ev && ev.session_id;
+  if (!ID.test(String(id))) return null;
   const st = readJSON(statePath(id)) || { prompts: [], generated: [], applied: null, appliedFrom: 0, calls: 0, done: false };
-  if (st.done) return;
+  if (st.done) return null;
   st.cwd = ev.cwd || st.cwd;
   st.calls++;
 
   const current = lastCustomTitle(ev.transcript_path);
   const pending = readJSON(pendingPath(id));
   if (current && current !== st.applied && !(pending && current === pending.title)) {
-    st.done = true; writeJSON(statePath(id), st); return;
+    st.done = true; writeJSON(statePath(id), st); return null;
   }
 
   const p = clean(ev.prompt).trim();
@@ -93,7 +158,23 @@ function hook() {
   }
   if (st.appliedFrom >= MAX_PROMPTS || st.calls >= MAX_CALLS) st.done = true;
   writeJSON(statePath(id), st);
-  if (out) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', sessionTitle: out } }));
+  return out;
+}
+
+// The guard runs first and in its own try, so autoname finishing, standing down or failing
+// cannot silence it, and a guard failure cannot change autoname's title or exit status.
+function hook() {
+  if (process.env.PUFFR_AUTONAME_CHILD || muted()) return;
+  const guard = guardOn(), names = !isOff();
+  if (!guard && !names) return;
+  let ev; try { ev = JSON.parse(fs.readFileSync(0, 'utf8')); } catch { return; }
+  let warn = null, title = null;
+  if (guard) { try { warn = coldWarning(ev); } catch {} }
+  if (names) { try { title = autonameStep(ev); } catch {} }
+  const o = {};
+  if (warn) o.systemMessage = warn;
+  if (title) o.hookSpecificOutput = { hookEventName: 'UserPromptSubmit', sessionTitle: title };
+  if (warn || title) process.stdout.write(JSON.stringify(o));
 }
 
 function pastTitles(exceptId) {
