@@ -770,6 +770,11 @@ git -C "$TH/under" init -q
 hlp() { HOME=$TH/home CLAUDE_CONFIG_DIR= node "$1/bin/puffr-help" --plain | grep -m1 '^PUFFR'; }
 SHA=$(git -C "$TH/co" rev-parse --short HEAD)
 chk "help from a git checkout shows its short commit" "$(hlp "$TH/co")" "PUFFR v$(jq -r .version .claude-plugin/plugin.json)  commit $SHA  Fu the Bloat. Cool the Burn."
+# A GIT_DIR inherited from the caller (hooks, git aliases, a shell inside another repo) must not redirect the lookup.
+mkdir -p "$TH/other"; git -C "$TH/other" init -q && git -C "$TH/other" -c user.name=t -c user.email=t@t commit -q --allow-empty -m other
+OSHA=$(git -C "$TH/other" rev-parse --short HEAD)
+[ "$OSHA" != "$SHA" ] && ok "fixture: the other repo has a different commit" || bad "fixture: the other repo has a different commit"
+chk "help ignores an inherited GIT_DIR and GIT_WORK_TREE" "$(HOME=$TH/home CLAUDE_CONFIG_DIR= GIT_DIR=$TH/other/.git GIT_WORK_TREE=$TH/other node "$TH/co/bin/puffr-help" --plain | grep -m1 '^PUFFR' | sed -n 's/.*commit \([0-9a-f]*\).*/\1/p')" "$SHA"
 printf '{"version":2,"plugins":{"puffr@puffr-tools":[{"scope":"user","installPath":"%s","version":"0","gitCommitSha":"819cb61968f2b1f9602d70ddd8f9c8bb60688418"}]}}' "$TH/plain" > "$TH/home/.claude/plugins/installed_plugins.json"
 case "$(hlp "$TH/plain")" in *"commit 819cb61 (install record)"*) ok "help from a copy without .git reads the install record";; *) bad "help from a copy without .git reads the install record (got: $(hlp "$TH/plain"))";; esac
 mkdir -p "$TH/cfg/plugins"; cp "$TH/home/.claude/plugins/installed_plugins.json" "$TH/cfg/plugins/"; rm "$TH/home/.claude/plugins/installed_plugins.json"

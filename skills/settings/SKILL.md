@@ -31,3 +31,5 @@ Arguments the user passed: "$ARGUMENTS"
 Which widgets appear at all, and on which line, is the layout's job: `/puffr:layout`. These switches hide a widget in every layout. `hud.reset` and `hud.pace` only show when `hud.rate` is on. `PUFFR_MOOD=off` in the environment also hides the fish.
 
 `model.haiku` is a choice, not a switch: `puffr-config set model.haiku on|off|never` (`get` reads it). `reset` leaves it alone so "never" stays never.
+
+`guard.cold` is an opt-in choice too: `puffr-config set guard.cold on|off` (`get` reads it). Unset means off, and `on all` and `reset` leave it alone. It warns at the next prompt when a large session's prompt cache has gone cold.

@@ -24,8 +24,10 @@ const version = (F.readJson(path.join(F.PUFFR_ROOT, '.claude-plugin', 'plugin.js
 // A plugin-cache copy has no .git; Claude Code records its commit in installed_plugins.json.
 const commit = (() => {
   const root = F.PUFFR_ROOT;
+  // An inherited GIT_DIR or GIT_WORK_TREE would point git at some other repo, so drop both.
+  const gitEnv = { ...process.env }; delete gitEnv.GIT_DIR; delete gitEnv.GIT_WORK_TREE;
   if (fs.existsSync(path.join(root, '.git'))) {
-    const r = spawnSync('git', ['-C', root, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 5000 });
+    const r = spawnSync('git', ['-C', root, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 5000, env: gitEnv });
     const sha = (r.stdout || '').trim();
     if (r.status === 0 && /^[0-9a-f]{4,40}$/.test(sha)) return sha;
   }

@@ -66,6 +66,9 @@ CACHE
   mid-session). The first request of a session shows as `cold start`.
 - **"Input billed at X% of uncached"** applies the standard cache multipliers (reads at each model's real
   read rate, 0.1× only for unpriced models; 5-minute write 1.25×, 1-hour write 2×) to your actual token mix.
+  Known limit: Haiku 5.5 charges 5× on every rate for a request whose prompt is over 100,000 tokens, and
+  the reports use the lower tier only, so those requests are understated by up to 5×. The cold-cache
+  warning (`guard.cold`) does apply the higher tier to its figure.
 - **Window size** is recorded by the HUD on each render, since transcripts don't carry it.
   Without the HUD it is assumed: 200k, or 1M if the session ever went past 200k. Override with
   `--window`.

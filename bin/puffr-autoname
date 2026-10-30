@@ -66,7 +66,7 @@ function lastCustomTitle(file) {
   return null;
 }
 
-// Cold-return guard. Warns once per cold period, never blocks, and costs nothing when off.
+// Cold-return guard. Warns once per cold period, never blocks, and when off reads no transcript and loads no lib.
 const COLD_TOKENS = 100000;     // warn only when the context to rewrite is larger than this
 const TAIL_BYTES = 262144;      // transcript tail read, as statusline.sh does
 const GUARD_DIR = path.join(DIR, 'guard');

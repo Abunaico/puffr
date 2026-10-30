@@ -110,5 +110,5 @@ Neither route deletes PUFFR's data in `~/.puffr` (settings, the radar index, sav
 
 ## Muting without uninstalling
 
-`/puffr:off` silences the HUD, fleet rows, banner, autoname, and watch notifications at once.
+`/puffr:off` silences the HUD, fleet rows, banner, autoname, the cold-cache guard, and watch notifications at once.
 `/puffr:on` brings them back. See [configuration.md](configuration.md#the-off-switch).

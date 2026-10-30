@@ -66,7 +66,7 @@ The active HUD layout is saved as `layout=<name>` in `~/.puffr/config`. See
 ## The config file
 
 `~/.puffr/config` holds `key=off` lines (anything not listed is on), `layout=<name>` (omitted for
-the default `compact`), and `model.haiku=<choice>`. You can edit it by hand. The HUD parses it in pure bash on every render, so
+the default `compact`), `model.haiku=<choice>`, and `guard.cold=on` when you have opted in. You can edit it by hand. The HUD parses it in pure bash on every render, so
 changes apply on the next one.
 
 ## Environment variables
@@ -93,7 +93,7 @@ changes apply on the next one.
 
 | File | Holds |
 |---|---|
-| `config` | Feature switches, layout, `model.haiku` |
+| `config` | Feature switches, layout, `model.haiku`, `guard.cold` |
 | `disabled` | Present while `/puffr:off` is in effect |
 | `layouts/<name>.yaml` | Your HUD layouts |
 | `bin/statusline` | The HUD launcher your statusLine points at |
@@ -106,6 +106,7 @@ changes apply on the next one.
 | `report-prompt.md` | Plain-English report rules |
 | `swarm.json` | Swarm readout config |
 | `autoname/` | Autoname state per session |
+| `guard/` | Cold-cache guard state per session: the assistant timestamp last warned about |
 | `insights.json` | Cached panel insights |
 | `instructions.json` | Cache for `puffr-instructions` |
 | `spend.json` | What puffr's own Haiku calls cost |

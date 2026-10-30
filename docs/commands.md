@@ -50,10 +50,10 @@ puffr-hud [status|install|repair|remove]
 puffr-config                               every feature and its state
 puffr-config on|off <feature>...           switch features
 puffr-config on|off all                    every feature at once
-puffr-config reset                         everything on; model.haiku is left alone
+puffr-config reset                         everything on; model.haiku and guard.cold are left alone
 puffr-config layout [<name>]               show or switch the HUD layout
 puffr-config layout new <name> [from]      copy a layout to ~/.puffr/layouts/<name>.yaml
-puffr-config set|get <setting> [value]     model.haiku: ask, on, off, never
+puffr-config set|get <setting> [value]     model.haiku: ask, on, off, never; guard.cold: on, off
 puffr-config haiku-check                   should a skill offer Haiku now? prints on, ask, or skip
 puffr-config --json
 ```
